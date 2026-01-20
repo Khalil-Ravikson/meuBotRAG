@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  # --- 1. WHATSAPP ENGINE ---
+  waha:
+    image: devlikeapro/waha
+    container_name: waha
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - WHATSAPP_DEFAULT_ENGINE=NOWEB
+      - WAHA_API_KEY=${WAHA_API_KEY}
+      - WAHA_DASHBOARD_USERNAME=admin
+      - WAHA_DASHBOARD_PASSWORD=${WAHA_DASHBOARD_PASS}
+    volumes:
+      - ./waha-data:/app/.sessions
+
+  # --- 2. BANCO DE DADOS VETORIAL ---
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: vectordb
+    restart: always
+    environment:
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+      - POSTGRES_DB=${DB_NAME}
+    volumes:
+      - ./pg-data:/var/lib/postgresql/data
+    # Não expus a porta 5432 para o host para evitar conflitos,
+    # a comunicação é interna via rede Docker.
+
+  # --- 3. SEU BOT INTELIGENTE ---
+  bot:
+    build: .
+    container_name: bot_rag
+    restart: always
+    depends_on:
+      - waha
+      - db # Espera o banco iniciar
+    ports:
+      - "8000:8000" # Porta para o Ngrok
+    volumes:
+      - ./src:/app/src     # Hot-reload
+      - ./dados:/app/dados # Acesso ao PDF
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - WAHA_API_KEY=${WAHA_API_KEY}
+      # URL interna do Docker para o WAHA
+      - WAHA_BASE_URL=http://waha:3000
+      # URL interna do Docker para o Banco
+      - DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}

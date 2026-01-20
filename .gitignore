@@ -1,0 +1,18 @@
+# Segurança (NUNCA REMOVA ISSO)
+.env
+.env.local
+
+# Sessões do WhatsApp e Dados do Banco
+waha-data/
+pgdata/
+postgres_data/
+
+# Python e Ambiente Virtual
+venv/
+__pycache__/
+*.pyc
+
+# Logs e Sistemas
+*.log
+.DS_Store
+.vscode/

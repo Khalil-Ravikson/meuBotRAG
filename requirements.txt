@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+requests
+python-dotenv
+langchain-groq
+langchain-community
+langchain-huggingface
+langchain-text-splitters
+langchain-postgres
+psycopg[binary]
+sqlalchemy
+pymupdf
+sentence-transformers
