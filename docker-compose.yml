@@ -33,7 +33,7 @@ services:
   # --- 3. SEU BOT INTELIGENTE ---
   bot:
     build: .
-    container_name: bot_rag
+    container_name: bot-rag
     restart: always
     depends_on:
       - waha
