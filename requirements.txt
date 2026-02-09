@@ -2,12 +2,22 @@ fastapi
 uvicorn
 requests
 python-dotenv
-langchain-groq
-langchain-community
-langchain-huggingface
-langchain-text-splitters
-langchain-postgres
+python-multipart
+# --- STACK ESTÁVEL (Família 0.2.x) ---
+langchain==0.2.16
+langchain-community==0.2.16
+langchain-core==0.2.38
+langchain-groq==0.1.9
+langchain-text-splitters==0.2.4
+langchain-postgres==0.0.9
+# langchain-redis removido (causava conflito)
+langchain-huggingface==0.0.3
+# -------------------------------------
 psycopg[binary]
 sqlalchemy
 pymupdf
 sentence-transformers
+llama-parse
+nest_asyncio
+groq
+redis

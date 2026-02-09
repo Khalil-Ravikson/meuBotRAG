@@ -29,6 +29,12 @@ services:
       - ./pg-data:/var/lib/postgresql/data
     # Não expus a porta 5432 para o host para evitar conflitos,
     # a comunicação é interna via rede Docker.
+  redis:
+    image: redis:alpine
+    container_name: redis-cache
+    restart: always
+    ports:
+      - "6379:6379"
 
   # --- 3. SEU BOT INTELIGENTE ---
   bot:
@@ -38,6 +44,7 @@ services:
     depends_on:
       - waha
       - db # Espera o banco iniciar
+      - redis # <--- O Bot agora espera o Redis ligar
     ports:
       - "8000:8000" # Porta para o Ngrok
     volumes:
@@ -47,6 +54,9 @@ services:
       - GROQ_API_KEY=${GROQ_API_KEY}
       - WAHA_API_KEY=${WAHA_API_KEY}
       # URL interna do Docker para o WAHA
-      - WAHA_BASE_URL=http://waha:3000
+      - WAHA_BASE_URL=${WAHA_BASE_URL}
       # URL interna do Docker para o Banco
       - DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
+
+      - REDIS_URL=${REDIS_URL}
+      - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY}

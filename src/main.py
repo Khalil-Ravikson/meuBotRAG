@@ -1,65 +1,100 @@
-from fastapi import FastAPI, Request, BackgroundTasks
-from src.services.waha_service import WahaService
-from src.services.rag_service import RagService
+import requests
+from fastapi import FastAPI, Request
 
-# Instancia os serviços
-app = FastAPI(title="Bot Modular RAG")
-waha = WahaService()
+from src.services.rag_service import RagService
+from src.config import settings
+from src.middleware.dev_guard import dev_guard_middleware  # 👈 middleware
+
+app = FastAPI()
 rag = RagService()
+
+# 🔐 REGISTRA O MIDDLEWARE (PORTEIRO)
+app.middleware("http")(dev_guard_middleware)
+
 
 @app.on_event("startup")
 async def startup_event():
-    """Roda quando o servidor liga"""
+    print("🚀 Iniciando Bot (Modo DEV — só eu converso)")
     rag.inicializar()
-    # OBS: Descomente a linha abaixo apenas na primeira vez para carregar o PDF
-    # Ou crie uma lógica para verificar se o banco está vazio
-    rag.ingerir_pdf() 
+    rag.ingerir_pdf()
 
-def processar_background(chat_id: str, texto: str, sender_name: str):
-    """Tarefa em segundo plano"""
-    print(f"🧠 Processando para {sender_name}: {texto}")
-    
-    # 1. Pega resposta da IA
-    resposta = rag.responder(texto)
-    
-    # 2. Envia volta
-    waha.enviar_mensagem(chat_id, f"🤖 {resposta}")
 
 @app.post("/webhook")
-async def webhook(req: Request, background_tasks: BackgroundTasks):
+async def webhook(request: Request):
+    """
+    ⚠️ ATENÇÃO:
+    - Todos os filtros (anti-loop, grupo, canal, etc.)
+      já rodam ANTES aqui no middleware.
+    - Aqui só entra mensagem válida.
+    """
     try:
-        data = await req.json()
-        # O WAHA às vezes manda o payload direto ou dentro de 'payload'
-        payload = data.get('payload', data)
+        data = await request.json()
+        payload = data.get("payload", {})
+        chat_id = payload.get("from")
 
-        # Extrai os dados com segurança (.get evita quebrar se não existir)
-        chat_id = payload.get('from')
-        texto = payload.get('body')
-        sender_name = payload.get('pushName', 'Usuário')
+        texto_usuario = ""
 
-        # --- 🚫 FILTRO 1: SEGURANÇA (Evita crash com imagem/figurinha) ---
-        # Se não tiver texto ou não for string, ignora.
-        if not texto or not isinstance(texto, str):
-            # print(f"🔇 Mensagem sem texto ignorada.")
-            return {"status": "ignored_empty"}
+        # 🎤 ÁUDIO
+        if (
+            payload.get("hasMedia")
+            and payload.get("media", {})
+            .get("mimetype", "")
+            .startswith("audio")
+        ):
+            print(f"🎤 Áudio detectado de {chat_id}")
 
-        # --- 🚫 FILTRO 2: IGNORAR GRUPOS ---
-        # Se o ID terminar em @g.us, é grupo. O bot fica quieto.
-        if "@g.us" in str(chat_id):
-            print(f"🔇 Mensagem de Grupo ignorada: {sender_name}")
-            return {"status": "ignored_group"}
+            media_url = payload["media"]["url"]
+            if not media_url.startswith("http"):
+                media_url = f"{settings.WAHA_BASE_URL}{media_url}"
 
-        # --- 🚫 FILTRO 3: IGNORAR A SI MESMO ---
-        if payload.get('fromMe', False):
-            return {"status": "ignored_self"}
+            try:
+                content = requests.get(media_url).content
+                temp_filename = f"/tmp/{chat_id}.ogg"
 
-        # --- ✅ PASSOU NOS FILTROS? PROCESSA! ---
-        print(f"📩 Recebido de {sender_name}: {texto}")
-        
-        # Agenda o processamento
-        background_tasks.add_task(processar_background, chat_id, texto, sender_name)
-            
+                with open(temp_filename, "wb") as f:
+                    f.write(content)
+
+                texto_usuario = rag.transcrever_audio(temp_filename)
+                print(f"📝 Transcrição: {texto_usuario}")
+
+            except Exception as e:
+                print(f"❌ Erro ao processar áudio: {e}")
+                return {"status": "audio_error"}
+
+        # 💬 TEXTO
+        else:
+            texto_usuario = payload.get("body", "")
+
+        if not texto_usuario:
+            print("⚠️ Mensagem vazia")
+            return {"status": "empty"}
+
+        # 🤖 IA RESPONDE
+        print(f"🤖 Agente pensando para {chat_id}...")
+        resposta = rag.responder(texto_usuario, user_id=chat_id)
+        print(f"📤 Resposta IA: {resposta}")
+
+        # 📡 ENVIA VIA WAHA
+        headers = {
+            "Content-Type": "application/json",
+            "X-Api-Key": settings.WAHA_API_KEY,
+        }
+
+        payload_resp = {
+            "chatId": chat_id,
+            "text": resposta,
+            "session": "default",
+        }
+
+        r = requests.post(
+            f"{settings.WAHA_BASE_URL}/api/sendText",
+            json=payload_resp,
+            headers=headers,
+        )
+
+        print(f"✅ Enviado para WAHA: {r.status_code}")
+        return {"status": "sent"}
+
     except Exception as e:
-        print(f"❌ Erro no webhook: {e}")
-        
-    return {"status": "ok"}
+        print(f"❌ ERRO NO WEBHOOK: {e}")
+        return {"status": "error"}

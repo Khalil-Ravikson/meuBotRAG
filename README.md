@@ -23,3 +23,6 @@ MeuBotRAG/
 ├── Dockerfile           # Configuração da imagem Python
 ├── requirements.txt     # Dependências do projeto
 └── .env                 # (Não comitado) Chaves de API e Senhas
+
+
+
