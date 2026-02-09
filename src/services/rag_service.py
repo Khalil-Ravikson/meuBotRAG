@@ -5,15 +5,25 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.agents import create_tool_calling_agent, AgentExecutor
 from langchain_core.runnables.history import RunnableWithMessageHistory
 
+
+
+
+
 # Importação correta da Community
 from langchain_community.chat_message_histories import RedisChatMessageHistory
 
 from langchain_core.tools import create_retriever_tool
-from langchain_core.documents import Document
 
 # Ingestão Avançada
 from llama_parse import LlamaParse
-from langchain_text_splitters import MarkdownHeaderTextSplitter
+
+# --- imports novos no topo do arquivo ---
+import re
+from langchain_text_splitters import (
+    MarkdownHeaderTextSplitter,
+    RecursiveCharacterTextSplitter
+)
+from langchain_core.documents import Document
 
 # Outros
 from src.config import settings
@@ -32,48 +42,114 @@ class RagService:
     # --- 1. INGESTÃO INTELIGENTE (LlamaParse) ---
     def ingerir_pdf(self):
         try:
-            # Busca dummy para checar se o banco está vazio
+            # Checa se o banco já tem algo
             if len(self.vectorstore.similarity_search("calendário", k=1)) > 0:
-                print("💾 Banco de dados já populado. Pulando ingestão.")
+                print("💾 Banco já populado. Pulando ingestão.")
                 return
-        except Exception as e:
-            print(f"⚠️ Falha na checagem do Banco (normal na primeira execução): {e}")
+        except Exception:
             pass
 
         if not os.path.exists(settings.PDF_PATH):
             print(f"⚠️ PDF não encontrado: {settings.PDF_PATH}")
             return
 
-        print("🕵️ LlamaParse: Convertendo PDF para Markdown estruturado...")
+        print("🕵️ LlamaParse: Convertendo PDF com parsing inteligente...")
+
+        # 🔥 SYSTEM PROMPT (igual ao do Colab)
+        system_prompt = """
+        Este é um calendário acadêmico.
+        IMPORTANTE:
+        1. IGNORE grades visuais mensais que contenham apenas números de dias (1, 2, 3...).
+        2. Extraia APENAS texto relacionado a eventos, feriados, prazos, início e fim de períodos.
+        3. Converta tabelas relevantes (atividades, público-alvo) em Markdown limpo.
+        4. Ignore cabeçalhos e rodapés institucionais repetitivos.
+        """
+
         try:
-            # CONFIGURAÇÃO CORRETA DO PARSER (Aqui que vai o result_type)
             parser = LlamaParse(
                 api_key=settings.LLAMA_CLOUD_API_KEY,
-                result_type="markdown",  # <--- CRÍTICO PARA LER TABELAS
-                verbose=True,
-                language="pt"
+                result_type="markdown",
+                language="pt",
+                system_prompt=system_prompt,
+                verbose=True
             )
+
             llama_docs = parser.load_data(settings.PDF_PATH)
-            
+
             if not llama_docs:
                 print("❌ LlamaParse não retornou conteúdo.")
                 return
 
-            texto_completo = llama_docs[0].text
-            
-            # Corta por Cabeçalhos (Melhor para tabelas e docs estruturados)
-            splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("#", "H1"), ("##", "H2")])
-            chunks = splitter.split_text(texto_completo)
-            
-            # Adiciona Metadados
-            for c in chunks: 
-                c.metadata["source"] = "calendario_2026"
+            # --- FUNÇÃO DE LIMPEZA ---
+            def clean_text(text: str) -> str:
+                if not text:
+                    return ""
 
-            self.vectorstore.add_documents(chunks)
-            print(f"✅ {len(chunks)} blocos estruturados salvos no Postgres!")
-            
+                # Remove pseudo-tabelas só com números
+                text = re.sub(r'^\|[\s\d\|-]+\|$', '', text, flags=re.MULTILINE)
+
+                # Remove lixo institucional
+                patterns = [
+                    r"UNIVERSIDADE ESTADUAL DO MARANHÃO",
+                    r"Pró-Reitoria de Graduação",
+                    r"Cidade Universitária Paulo VI",
+                    r"www\.uema\.br",
+                ]
+                for p in patterns:
+                    text = re.sub(p, "", text, flags=re.IGNORECASE)
+
+                # Normaliza quebras de linha
+                text = re.sub(r"\n{3,}", "\n\n", text)
+                return text.strip()
+
+            # --- SPLITTER POR CABEÇALHOS ---
+            header_splitter = MarkdownHeaderTextSplitter(
+                headers_to_split_on=[
+                    ("#", "contexto_macro"),
+                    ("##", "secao_referencia"),
+                    ("###", "topico_especifico"),
+                ]
+            )
+
+            # --- SPLITTER POR TAMANHO ---
+            size_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=100,
+                separators=["\n\n", "\n", "###", "##"]
+            )
+
+            all_chunks: list[Document] = []
+
+            print("📦 Processando e limpando chunks...")
+
+            for doc in llama_docs:
+                cleaned_text = clean_text(doc.text)
+
+                if not cleaned_text:
+                    continue
+
+                # Split semântico
+                header_docs = header_splitter.split_text(cleaned_text)
+
+                # Injeta metadados
+                for hdoc in header_docs:
+                    hdoc.metadata.update(doc.metadata)
+                    hdoc.metadata["source"] = "calendario_2026"
+
+                # Split final por tamanho
+                final_chunks = size_splitter.split_documents(header_docs)
+                all_chunks.extend(final_chunks)
+
+            if not all_chunks:
+                print("⚠️ Nenhum chunk útil gerado.")
+                return
+
+            self.vectorstore.add_documents(all_chunks)
+            print(f"✅ {len(all_chunks)} chunks limpos salvos no Postgres!")
+
         except Exception as e:
-            print(f"❌ Erro durante a ingestão: {e}")
+            print(f"❌ Erro durante ingestão avançada: {e}")
+
 
     # --- 2. TRANSCRIÇÃO DE ÁUDIO ---
     def transcrever_audio(self, caminho_arquivo):
@@ -97,61 +173,42 @@ class RagService:
     def inicializar(self):
         print("🧠 Inicializando Agente de IA...")
 
-        # Transforma o Banco Vetorial na Ferramenta 'buscar_no_calendario'
-        retriever = self.vectorstore.as_retriever(search_kwargs={"k": 5})
+        # --- Retriever ---
+        retriever = self.vectorstore.as_retriever(
+            search_type="mmr",
+            search_kwargs={        
+                            "k": 5,
+                            "fetch_k": 20,
+                            "lambda_mult": 0.5
+                            })
         tool_pdf = create_retriever_tool(
             retriever,
             "buscar_no_calendario",
             "Use para buscar datas, feriados, prazos e regras no calendário acadêmico oficial."
         )
 
-        # Lista correta de ferramentas
         tools = [tool_pdf, abrir_chamado_glpi, consultar_fila]
 
-        # LLM conectada às ferramentas
+        # --- LLM ---
         llm = ChatGroq(
             api_key=settings.GROQ_API_KEY,
             model="llama-3.3-70b-versatile",
-            temperature=0.3 # Mais baixo = Mais sério/preciso
-        ).bind_tools(tools)
+            temperature=0.3
+        )
 
-        # Prompt do Sistema (Blindado e Sério)
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", """Você é o Assistente Virtual Institucional da UEMA (Universidade Estadual do Maranhão).
-            Sua postura é ESTRITAMENTE profissional, objetiva e impessoal.
-            
-            🚨 REGRAS DE OURO (ESCOPO):
-            1. O seu ÚNICO objetivo é auxiliar com: Calendário Acadêmico, Suporte Técnico (GLPI) e Processos da UEMA.
-            2. Se o usuário falar sobre QUALQUER assunto externo (política, futebol, promoções, receitas, piadas, clima, fofoca), você DEVE responder:
-               "Desculpe, meu escopo de atuação limita-se exclusivamente a assuntos acadêmicos e técnicos da UEMA."
-            3. NÃO emita opiniões pessoais e NÃO tente ser engraçado.
-            
-            🛠️ INSTRUÇÕES DE FERRAMENTAS:
-            - Perguntas sobre Datas, Prazos ou Feriados: Você É OBRIGADO a usar a ferramenta 'buscar_no_calendario'. Não invente datas.
-            - Relato de Problemas (PC quebrou, sem internet): Use 'abrir_chamado_glpi'.
-            - Consultas de Status: Use 'consultar_fila'.
-            
-            👋 SAUDAÇÕES:
-            - Se o usuário disser "Oi", "Bom dia", etc: Responda apenas: "Olá. Sou o assistente da UEMA. Em que posso ajudar referente à universidade?"
-            
-            Seja breve. Não enrole."""),
-            MessagesPlaceholder(variable_name="history"), 
-            ("human", "{input}"),
-            ("placeholder", "{agent_scratchpad}"), 
-            ])
+        # --- Agente ---
+        agent_executor = self._criar_agente(llm, tools)
 
-        # Cria o Agente
-        agent = create_tool_calling_agent(llm, tools, prompt)
-        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True)
-
-        # Adiciona Memória (Redis)
+        # --- Memória Redis ---
         self.agent_with_history = RunnableWithMessageHistory(
             agent_executor,
             self.get_session_history,
             input_messages_key="input",
             history_messages_key="history"
         )
+
         print("✅ Agente Pronto!")
+
 
     def responder(self, texto: str, user_id: str):
         if self.agent_with_history is None:
@@ -168,3 +225,43 @@ class RagService:
         except Exception as e:
             print(f"❌ Erro ao gerar resposta: {e}")
             return "Desculpe, tive um erro interno ao processar seu pedido."
+        
+        
+    
+    
+    def _criar_agente(self, llm, tools):
+        # Prompt do Sistema (Blindado e Sério)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """Você é o Assistente Virtual Institucional da UEMA (Universidade Estadual do Maranhão).
+                Sua postura é ESTRITAMENTE profissional, objetiva e impessoal.
+
+                🚨 REGRAS DE OURO (ESCOPO):
+                1. O seu ÚNICO objetivo é auxiliar com: Calendário Acadêmico, Suporte Técnico (GLPI) e Processos da UEMA.
+                2. Se o usuário falar sobre QUALQUER assunto externo (política, futebol, promoções, receitas, piadas, clima, fofoca), você DEVE responder:
+                "Desculpe, meu escopo de atuação limita-se exclusivamente a assuntos acadêmicos e técnicos da UEMA."
+                3. NÃO emita opiniões pessoais e NÃO tente ser engraçado.
+
+                🛠️ INSTRUÇÕES DE FERRAMENTAS:
+                - Perguntas sobre Datas, Prazos ou Feriados: Você É OBRIGADO a usar a ferramenta 'buscar_no_calendario'. Não invente datas.
+                - Relato de Problemas (PC quebrou, sem internet): Use 'abrir_chamado_glpi'.
+                - Consultas de Status: Use 'consultar_fila'.
+
+                👋 SAUDAÇÕES:
+                - Se o usuário disser "Oi", "Bom dia", etc: Responda apenas:
+                "Olá. Sou o assistente da UEMA. Em que posso ajudar referente à universidade?"
+
+                Seja breve. Não enrole."""),
+                    MessagesPlaceholder(variable_name="history"),
+                    ("human", "{input}"),
+                    ("placeholder", "{agent_scratchpad}"),
+                ])
+
+        agent = create_tool_calling_agent(llm, tools, prompt)
+
+        return AgentExecutor(
+            agent=agent,
+            tools=tools,
+            verbose=True
+        )
+
+    

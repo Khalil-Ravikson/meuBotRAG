@@ -48,6 +48,7 @@ services:
     ports:
       - "8000:8000" # Porta para o Ngrok
     volumes:
+      - .:/app
       - ./src:/app/src     # Hot-reload
       - ./dados:/app/dados # Acesso ao PDF
     environment:
