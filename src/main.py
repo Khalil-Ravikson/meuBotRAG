@@ -1,107 +1,152 @@
-import time
 import redis
+import logging
+from src.services.logger_service import LogService # Importe no topo
 from fastapi import FastAPI, Request
 from src.services.rag_service import RagService
 from src.services.waha_service import WahaService
 from src.config import settings
+from src.services.menu_service import MenuService
+# --- 0. CONFIGURAÇÃO DE LOGS (SILENCIADOR) ---
+# Isso remove o spam de "POST /webhook HTTP/1.1 200 OK" do terminal
+class EndpointFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage().find("/webhook") == -1
 
+logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
+
+# --- INICIALIZAÇÃO ---
 app = FastAPI()
-
 rag = RagService()
 waha = WahaService()
-
-# --- CONEXÃO REDIS ---
+menu = MenuService()
+# --- CONEXÃO REDIS (Trava de Segurança) ---
 try:
     r = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    r.ping()
     print("✅ Conectado ao Redis!")
-except:
-    print("⚠️ Rodando sem Redis (Rate Limit desativado)")
-    r = None
+except Exception as e:
+    print(f"❌ ERRO CRÍTICO: Redis Off. O bot não iniciará para economizar tokens.")
+    raise e
 
 # --- CONFIGURAÇÕES ---
 DEV_MODE = True
-# 👇 Coloque aqui o número do celular que você usou para testar (o que mandou o "Oi")
-DEV_WHITELIST = ["559887680098","175174737518829"] 
+DEV_WHITELIST = ["559887680098", "175174737518829"] 
 
 @app.on_event("startup")
 async def startup_event():
     print(f"🚀 Bot Iniciado! Modo DEV: {DEV_MODE}")
+    
+    # 1. Inicializa a IA e ingestão de dados
     rag.inicializar()
+    
+    # 2. Configura o Webhook via código
+    await waha.configurar_webhook()
 
 @app.post("/webhook")
 async def webhook(request: Request):
     try:
         data = await request.json()
 
-        # Validações básicas
-        if data.get('event') != 'message': return {"status": "ignored_event"}
-        if not data.get('payload'): return {"status": "ignored_empty"}
+        # 1. Filtro de Evento
+        if data.get('event') != 'message': 
+            return {"status": "ignored_event"}
 
-        payload = data['payload']
+        payload = data.get('payload')
+        if not payload: 
+            return {"status": "ignored_empty"}
+
+        # 2. ANTI-LOOP (Checagem Booleana Estrita)
+        # Garante que não responde a si mesmo
+        if payload.get('fromMe') is True:
+            return {"status": "ignored_self"}
+
+        # 3. Extração de Dados
         chat_id = payload.get('from')
-        event_id = data.get('id') or payload.get('id')
-        body = payload.get('body', '').strip()
-        has_media = payload.get('hasMedia', False)
+        if not chat_id: return {"status": "no_chat_id"}
         
-        # Extrai apenas os números do telefone (ex: 5598988887777)
-        sender_phone = chat_id.split('@')[0] if chat_id else "desconhecido"
+        sender_phone = chat_id.split('@')[0]
+        event_id = data.get('id') or payload.get('id')
 
-        # --- 🛡️ 1. FILTROS DE ORIGEM ---
-        if payload.get('fromMe'): return {"status": "ignored_self"}
+        # 4. Filtros de Bloqueio (Grupos, Status, Dev Mode)
         if "@g.us" in str(chat_id): return {"status": "ignored_group"}
         if "status@broadcast" in str(chat_id): return {"status": "ignored_status"}
 
-        # --- 🛡️ 2. MODO DEV (O Porteiro) ---
         if DEV_MODE and sender_phone not in DEV_WHITELIST:
-            print(f"🚧 Modo DEV: Ignorando {sender_phone} (Não está na Whitelist)")
-            return {"status": "ignored_dev_mode"}
+            print(f"🚧 Modo DEV: Ignorando {sender_phone}")
+            return {"status": "ignored_dev"}
 
-        # --- 🛡️ 3. FILTRO DE CONTEÚDO (A CORREÇÃO DO LOG VAZIO) ---
+        # 5. Rate Limit & Deduplicação (Redis)
+        # Evita processar a mesma mensagem duas vezes
+        if r.get(f"evt:{event_id}"):
+            print(f"♻️ Duplicata ignorada: {event_id}")
+            return {"status": "ignored_duplicate"}
+        r.setex(f"evt:{event_id}", 300, "1")
+
+        # Limite de velocidade (5 msgs a cada 10s)
+        key_rate = f"rate:{sender_phone}"
+        requests = r.incr(key_rate)
+        if requests == 1: r.expire(key_rate, 10)
         
-        # Se for mídia explícita, ignora
+        if requests > 5:
+            print(f"🚦 Rate limit: {sender_phone}")
+            return {"status": "rate_limited"}
+
+        # 6. Conteúdo da Mensagem
+        has_media = payload.get('hasMedia', False)
+        raw_body = payload.get('body')
+        body = (raw_body or "").strip()
+
         if has_media:
             print(f"🔇 Mídia ignorada de {sender_phone}")
             return {"status": "ignored_media"}
 
-        # 👇 A MÁGICA: Recuperação de Tipo 👇
-        # Tenta pegar o tipo. Se vier vazio mas tiver texto, assume que é 'chat'.
-        msg_type = payload.get('_data', {}).get('type')
-        if not msg_type and body:
-            msg_type = 'chat'
-        
-        # Agora verifica se é um tipo válido
-        if msg_type not in ['chat', 'text']:
-            print(f"🔇 Tipo ignorado: '{msg_type}'") # Agora vai mostrar o que é, se não for chat
-            return {"status": "ignored_msg_type"}
-
         if not body:
             return {"status": "ignored_empty_body"}
 
-        # --- 🛡️ 4. REDIS (Proteção Anti-Flood) ---
-        if r:
-            # Deduplicação
-            if r.get(f"evt:{event_id}"):
-                print(f"♻️ Duplicata ignorada: {event_id}")
-                return {"status": "ignored_duplicate"}
-            r.setex(f"evt:{event_id}", 300, "1")
+        # --- 7. CÉREBRO DO ROTEADOR (ROUTER) ---
+        # Analisa a intenção antes de chamar a IA cara
+        analise = router.analisar(body)
+        rota = analise["rota"]
+        contexto_extra = analise.get("contexto", "")
 
-            # Rate Limit (5 msgs a cada 10s)
-            key = f"rate:{sender_phone}"
-            if r.incr(key) == 1: r.expire(key, 10)
-            if int(r.get(key) or 0) > 5:
-                print(f"🚦 Rate limit estourado: {sender_phone}")
-                return {"status": "rate_limited"}
+        print(f"🧭 Rota: {rota} | Contexto: {contexto_extra}")
 
-        # --- 🧠 CÉREBRO: Processar e Responder ---
-        print(f"🤖 Processando mensagem de {sender_phone}: {body}")
+# 🚦 LÓGICA DE NAVEGAÇÃO HIERÁRQUICA
+        decisao = menu.processar_escolha(sender_phone, body)
+
+        if decisao["type"] == "msg":
+            # Responde menus/submenus instantaneamente (Custo 0)
+            await waha.enviar_mensagem(chat_id, decisao["content"])
+            return {"status": "menu_ok"}
+
+        # Se for action, envia para a IA com o prompt que o menu preparou
+        prompt_final = decisao["prompt"]
+        resposta = rag.responder(prompt_final, user_id=sender_phone)
+        await waha.enviar_mensagem(chat_id, resposta)
         
-        resposta = rag.responder(body, user_id=chat_id)
-        
-        # Envia a resposta de volta
-        waha.enviar_mensagem(chat_id, resposta)
-
         return {"status": "processed"}
 
     except Exception as e:
-        print(f"❌ Erro no Webhook: {e}")
-        return {"status": "error"}
+        # O teu LogService entra em ação aqui
+        logger_service.log_error(sender_phone, "WEBHOOK_CRITICAL", str(e))
+        await waha.enviar_mensagem(chat_id, "Estou com uma instabilidade momentânea. Tente em 1 minuto.")
+        return {"status": "error_handled"}
+    
+    except Exception as e:
+        # 1. Loga o erro detalhado no Redis
+        logger = LogService()
+        logger.log_error(sender_phone, "CRITICAL_WEBHOOK_FAILURE", str(e))
+        
+        print(f"❌ Erro Crítico Controlado: {e}")
+        
+        # 2. Resposta de Emergência para o Usuário (Self-Healing)
+        # Se a IA morreu, o Python assume e manda um aviso.
+        msg_erro = "Indisponibilidade momentânea nos meus sistemas neurais. 😵‍💫\nPor favor, tente novamente em 1 minuto."
+        
+        # Tenta enviar o aviso pelo Waha (se o Waha estiver vivo)
+        try:
+            await waha.enviar_mensagem(chat_id, msg_erro)
+        except:
+            print("💀 Waha também morreu. Nada a fazer.")
+            
+        return {"status": "error_handled"}

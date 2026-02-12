@@ -1,23 +1,30 @@
+# --- API & Core ---
 fastapi
 uvicorn
 requests
 python-dotenv
 python-multipart
-# --- STACK ESTÁVEL (Família 0.2.x) ---
+nest_asyncio
+httpx>=0.24.0
+
+# --- Stack LangChain (Estável 0.2.x) ---
 langchain==0.2.16
 langchain-community==0.2.16
 langchain-core==0.2.38
 langchain-groq==0.1.9
 langchain-text-splitters==0.2.4
 langchain-postgres==0.0.9
-# langchain-redis removido (causava conflito)
+# langchain-redis removido (causava conflito, usamos o 'redis' puro abaixo)
 langchain-huggingface==0.0.3
-# -------------------------------------
-psycopg[binary]
-sqlalchemy
-pymupdf
-sentence-transformers
-llama-parse
-nest_asyncio
+
+# --- Integrações & Drivers ---
 groq
 redis
+llama-parse
+pymupdf
+sentence-transformers
+
+# --- Banco de Dados ---
+psycopg[binary]
+sqlalchemy
+pgvector

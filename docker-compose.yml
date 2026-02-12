@@ -58,6 +58,6 @@ services:
       - WAHA_BASE_URL=${WAHA_BASE_URL}
       # URL interna do Docker para o Banco
       - DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
-
+          
       - REDIS_URL=${REDIS_URL}
       - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY}

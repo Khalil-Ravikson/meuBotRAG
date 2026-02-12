@@ -1,3 +1,5 @@
+
+###funções iniciais porem decidir modulrizar
 from langchain_core.tools import tool
 import random
 

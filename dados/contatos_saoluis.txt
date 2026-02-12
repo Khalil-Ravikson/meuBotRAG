@@ -1,0 +1,28 @@
+=== LISTA DE CONTATOS UEMA (SÃO LUÍS / PAULO VI) ===
+
+[ADMINISTRAÇÃO SUPERIOR]
+Setor: Reitoria | Gestor: Walter Canales | Email: waltercanales@uema.br | Telefone: 2016-9000 / 2016-8100
+Setor: Vice-Reitoria | Gestor: Paulo Catunda | Email: vicereitoria@uema.br | Telefone: 2016-9005
+Setor: Gabinete da Reitoria (GR) | Email: reitoria@uema.br | Telefone: 2016-8106
+Setor: Procuradoria Jurídica (PJ) | Gestor: Adolfo Testi | Email: pj@uema.br | Ramais: 9060/9061
+Setor: Ouvidoria | Email: ouvidoria@uema.br
+
+[PRÓ-REITORIAS - LOCALIZADAS EM SÃO LUÍS]
+Setor: PROG (Pró-Reitoria de Graduação) | Foco: Matrículas, Diplomas, SIGUEMA | Email: prog@uema.br
+Setor: PROINFRA (Infraestrutura) | Foco: Prefeitura de Campus, Manutenção, Transporte | Email: proinfra@uema.br
+Setor: PROEXAE (Assistência Estudantil) | Foco: Auxílios, RU, Bolsas | Email: proexae@uema.br
+Setor: PROPLAD (Planejamento) | Email: proplad@uema.br
+
+[PROGRAMAS ESPECIAIS]
+Setor: Programa Ensinar | Email Geral: cgeral@ensinar.uema.br | Site: www.ensinar.uema.br
+Setor: Coord. Biologia (Ensinar) | Email: cienciasbiologicas.licenciatura@ensinar.uema.br
+Setor: Coord. Física (Ensinar) | Email: fisica.licenciatura@ensinar.uema.br
+Setor: Coord. Geografia (Ensinar) | Email: geografia.licenciatura@ensinar.uema.br
+Setor: Coord. História (Ensinar) | Email: direcaohistoria@ensinar.uema.br
+
+[CENTROS DE ENSINO - CAMPUS PAULO VI]
+(Nota: Adicionar telefones específicos se disponíveis no rodapé do site)
+Setor: CCT (Centro de Ciências Tecnológicas) | Cursos: Engenharias, Arquitetura, Matemática | Local: Prédio do CCT
+Setor: CCA (Centro de Ciências Agrárias) | Cursos: Agronomia, Veterinária, Zootecnia | Local: Prédio do CCA / Fazenda Escola
+Setor: CCSA (Centro de Ciências Sociais Aplicadas) | Cursos: Direito, Administração, CSO | Local: Prédio do CCSA
+Setor: CECEN (Centro de Educação e Ciências Exatas) | Cursos: Licenciaturas, Letras, Pedagogia | Local: Prédio do CECEN

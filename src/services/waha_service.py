@@ -1,67 +1,63 @@
-import requests
-import time
+import httpx
+import logging
+import asyncio
 from src.config import settings
+
+logger = logging.getLogger(__name__)
 
 class WahaService:
     def __init__(self):
         self.base_url = settings.WAHA_BASE_URL
+        self.api_key = settings.WAHA_API_KEY
         self.headers = {
-            "X-Api-Key": settings.WAHA_API_KEY,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "X-Api-Key": self.api_key,
         }
-        # 🚀 Já configura o Webhook assim que a classe é iniciada
-        self.configurar_webhook()
+        # Se não tiver URL no env, assume o padrão interno do Docker
+        self.webhook_url = settings.WHATSAPP_HOOK_URL or "http://bot-rag:8000/webhook"
+        self.events = ["message"]
 
-    def configurar_webhook(self):
+    async def configurar_webhook(self):
         """
-        Diz ao WAHA: "Mande todas as mensagens para http://bot-rag:8000/webhook"
+        Força o registro do Webhook no Waha via API assim que o bot liga.
         """
-        print("🔗 Configurando Webhook no WAHA...")
-        
         url = f"{self.base_url}/api/sessions/default/webhook"
-        
-        # Endereço interno do Docker (O WAHA chama o Bot por aqui)
-        webhook_target = "http://bot-rag:8000/webhook"
-        
         payload = {
-            "url": webhook_target,
-            "events": ["message", "session.status"], # Escuta mensagens e status da conexão
-            "allUnreadOnStart": False # Evita processar mensagens velhas ao reiniciar
+            "url": self.webhook_url,
+            "events": self.events
         }
 
-        try:
-            # Tenta configurar. Se o WAHA estiver acordando, tenta algumas vezes.
-            for tentativa in range(3):
-                try:
-                    r = requests.post(url, json=payload, headers=self.headers)
-                    if r.status_code in [200, 201]:
-                        print(f"✅ Webhook configurado com sucesso: {webhook_target}")
-                        return
-                    else:
-                        print(f"⚠️ Tentativa {tentativa+1}: WAHA retornou {r.status_code} - {r.text}")
-                except requests.exceptions.ConnectionError:
-                    print(f"⏳ Tentativa {tentativa+1}: WAHA ainda não está acessível...")
+        print(f"🔌 Tentando registrar Webhook em: {self.webhook_url}...")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                # Tenta registrar (POST)
+                r = await client.post(url, json=payload, headers=self.headers)
                 
-                time.sleep(2) # Espera 2 segundos antes de tentar de novo
-            
-            print("❌ Falha ao configurar Webhook após tentativas.")
+                if r.status_code in [200, 201]:
+                    print(f"✅ Webhook configurado com sucesso!")
+                else:
+                    # Se der erro, tenta a rota alternativa (PUT/PATCH) dependendo da versão
+                    print(f"⚠️ Aviso Waha ({r.status_code}): {r.text}")
 
-        except Exception as e:
-            print(f"❌ Erro crítico ao configurar webhook: {e}")
+            except Exception as e:
+                print(f"❌ Falha ao configurar Webhook: {e}")
 
-    def enviar_mensagem(self, chat_id: str, texto: str):
+    async def enviar_mensagem(self, chat_id: str, texto: str):
+        if not chat_id or not texto:
+            return
+
         url = f"{self.base_url}/api/sendText"
         payload = {
             "session": "default",
             "chatId": chat_id,
             "text": texto
         }
-        try:
-            print(f"📤 Enviando para {chat_id}...")
-            r = requests.post(url, json=payload, headers=self.headers)
-            if r.status_code == 201:
-                print("✅ Mensagem enviada!")
-            else:
-                print(f"⚠️ Erro WAHA: {r.status_code} - {r.text}")
-        except Exception as e:
-            print(f"❌ Erro de conexão com WAHA: {e}")
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            try:
+                response = await client.post(url, json=payload, headers=self.headers)
+                if response.status_code not in [200, 201]:
+                    print(f"⚠️ Erro envio Waha ({response.status_code}): {response.text}")
+            except Exception as e:
+                print(f"❌ Erro de Conexão: {e}")

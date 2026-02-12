@@ -1,0 +1,18 @@
+=== CURSO: ENGENHARIA DE COMPUTAÇÃO (BACHARELADO) ===
+Local: Campus Paulo VI - São Luís - MA
+Centro: CCT (Centro de Ciências Tecnológicas)
+Carga Horária Total: 3915 horas
+
+[DISCIPLINAS OBRIGATÓRIAS - DESTAQUES POR NÍVEL]
+
+9º Nível (Fase Final):
+- ASL092N936: PROJETO DE TRABALHO DE CONCLUSÃO DE CURSO (TCC 1) - 60h (4 créditos)
+- ASL092N939: SISTEMAS DE COMUNICAÇÃO MÓVEIS E DE RÁDIO ACESSO - 60h (3 créditos)
+
+8º Nível:
+- GESTÃO DE PROJETOS - 60h
+- INFRAESTRUTURA DE CABEAMENTOS ELÉTRICA E LÓGICO - 60h
+
+[PERFIL DO CURSO]
+O curso foca em desenvolvimento de software, hardware, sistemas embarcados e robótica.
+Possui forte carga horária prática em laboratório.
