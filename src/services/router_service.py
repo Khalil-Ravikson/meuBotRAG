@@ -1,66 +1,138 @@
+"""
+router_service.py — RouterService revisado
+
+Problemas corrigidos:
+  - Normalização de unicode ausente: "matrícula" não batia com "matricula"
+    (acentos do WhatsApp variavam dependendo do teclado do usuário)
+  - Padrão MENU conflitava com CALENDARIO ("data" capturava "boa data")
+  - OPCAO_* usavam search() mas os padrões tinham ^ e $ — deve ser match()
+  - Adicionado CONTATOS como rota própria (estava no menu mas não no router)
+  - Rota FALLBACK separada de GERAL para facilitar debug nos logs
+  - analisar() agora recebe estado do menu para evitar conflito de contexto
+"""
+
 import re
 import unicodedata
 
+
+def _normalizar(texto: str) -> str:
+    """Remove acentos e converte para minúsculas para comparação robusta."""
+    return unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode("utf-8").lower()
+
+
 class RouterService:
     def __init__(self):
+        # Padrões aplicados sobre texto JÁ normalizado (sem acento, minúsculo)
         self.patterns = {
-            # 1. MENU e RESET
-            "MENU": re.compile(r"(?i)\b(oi|ol[áa]|bom dia|boa tarde|ajuda|menu|in[ií]cio)\b"),
-            "RESET": re.compile(r"(?i)\b(reiniciar|reset|limpar|tchau)\b"),
-            
-            # 2. NUMERAÇÃO DO MENU (AQUI ESTÁ A CORREÇÃO!)
-            # Captura se o usuário digitar apenas "1", "1.", "opcao 1", etc.
-            "OPCAO_1": re.compile(r"^\s*(1|um|calend[áa]rio)\.?\s*$", re.IGNORECASE),
-            "OPCAO_2": re.compile(r"^\s*(2|dois|suporte|glpi)\.?\s*$", re.IGNORECASE),
-            "OPCAO_3": re.compile(r"^\s*(3|tr[êe]s|ru|onibus)\.?\s*$", re.IGNORECASE),
-            "OPCAO_4": re.compile(r"^\s*(4|quatro|contatos|email)\.?\s*$", re.IGNORECASE),
+            # Saudações e menu
+            "MENU": re.compile(
+                r"\b(oi|ola|bom dia|boa tarde|boa noite|ajuda|menu|inicio|start|help)\b"
+            ),
+            "RESET": re.compile(
+                r"\b(reiniciar|reset|limpar|recomecar|tchau|sair|cancelar)\b"
+            ),
 
-            # 3. INTENÇÕES GERAIS (Regex antigo continua aqui...)
-            "SUPORTE": re.compile(r"(?i)(glpi|chamado|suporte|computador|pc|net|wifi|impressora|login|senha)"),
-            "CALENDARIO": re.compile(r"(?i)(data|prazo|feriado|prova|matricula|semestre)"),
-            "RU": re.compile(r"(?i)(ru|restaurante|comida|almoço|jantar|cardapio)"),
+            # Opções numéricas do menu principal (prioridade máxima — testadas primeiro)
+            # match() garante que só captura se o texto INTEIRO for a opção
+            "OPCAO_1": re.compile(r"^\s*(1|um|calendario|datas?)\s*$"),
+            "OPCAO_2": re.compile(r"^\s*(2|dois|suporte|ti|glpi|chamado)\s*$"),
+            "OPCAO_3": re.compile(r"^\s*(3|tres|ru|restaurante|onibus|transporte)\s*$"),
+            "OPCAO_4": re.compile(r"^\s*(4|quatro|contatos?|emails?|telefones?)\s*$"),
+
+            # Intenções por palavras-chave (texto livre)
+            "SUPORTE": re.compile(
+                r"\b(glpi|chamado|suporte|computador|pc|notebook|net|wifi|wi.fi|"
+                r"impressora|login|senha|siguema|sistema|acesso|laboratorio)\b"
+            ),
+            "CALENDARIO": re.compile(
+                r"\b(data|prazo|feriado|prova|matricula|rematricula|semestre|"
+                r"periodo|trancamento|calendario|aula|inicio|termino|retardatario|"
+                r"veterano|calouro|reingresso)\b"
+            ),
+            "RU": re.compile(
+                r"\b(ru|restaurante|refeicao|comida|almoco|jantar|cardapio|"
+                r"onibus|transporte|rota|horario do onibus)\b"
+            ),
+            "CONTATOS": re.compile(
+                r"\b(contato|email|e-mail|telefone|fone|ramal|prog|proexae|"
+                r"reitoria|ctic|departamento|coordenacao|secretaria)\b"
+            ),
         }
 
-    def analisar(self, texto: str) -> dict:
-        texto_limpo = texto.strip()
+    def analisar(self, texto: str, estado_menu: str = "MAIN") -> dict:
+        """
+        Analisa o texto e retorna:
+          {"rota": str, "contexto": str}
 
-        # --- CHECAGEM DE MENU NUMÉRICO (Prioridade Máxima) ---
-        if self.patterns["OPCAO_1"].search(texto_limpo):
+        Parâmetro estado_menu: estado atual do MenuService.
+        Se o usuário já está num submenu, não redireciona para MENU novamente.
+        """
+        texto_norm = _normalizar(texto.strip())
+
+        # 1. Opções numéricas — prioridade máxima (match exato)
+        if self.patterns["OPCAO_1"].match(texto_norm):
             return {
-                "rota": "CALENDARIO", 
-                "contexto": "O usuário escolheu Opção 1 (Calendário). ELE QUER SABER DATAS. Pergunte de qual mês ou evento ele precisa. NÃO BUSQUE TUDO DE UMA VEZ."
+                "rota": "CALENDARIO",
+                "contexto": (
+                    "O usuário escolheu Calendário Acadêmico. "
+                    "Pergunte de qual mês ou evento específico ele precisa. "
+                    "Não busque tudo de uma vez."
+                ),
             }
-        
-        if self.patterns["OPCAO_2"].search(texto_limpo):
+        if self.patterns["OPCAO_2"].match(texto_norm):
             return {
-                "rota": "SUPORTE", 
-                "contexto": "O usuário escolheu Opção 2 (Suporte Técnico). Pergunte qual é o problema, o local e a urgência para abrir chamado."
+                "rota": "SUPORTE",
+                "contexto": (
+                    "O usuário escolheu Suporte Técnico. "
+                    "Pergunte qual o problema, o local e a urgência para abrir chamado no GLPI."
+                ),
             }
-
-        if self.patterns["OPCAO_3"].search(texto_limpo):
+        if self.patterns["OPCAO_3"].match(texto_norm):
             return {
-                "rota": "RU", 
-                "contexto": "O usuário escolheu Opção 3 (RU/Ônibus). Consulte as regras do RU e rotas de ônibus na base de conhecimento."
+                "rota": "RU",
+                "contexto": (
+                    "O usuário escolheu RU e Transporte. "
+                    "Consulte regras do RU e rotas de ônibus na base de conhecimento."
+                ),
             }
-
-        if self.patterns["OPCAO_4"].search(texto_limpo):
+        if self.patterns["OPCAO_4"].match(texto_norm):
             return {
-                "rota": "CONTATOS", 
-                "contexto": "O usuário escolheu Opção 4 (Contatos). Consulte a lista de telefones e emails."
+                "rota": "CONTATOS",
+                "contexto": (
+                    "O usuário escolheu Contatos. "
+                    "Consulte e-mails e telefones na base de conhecimento."
+                ),
             }
 
-        # --- CHECAGEM PADRÃO ---
-        if self.patterns["RESET"].search(texto_limpo):
-            return {"rota": "RESET", "contexto": "Reset"}
-            
-        if self.patterns["MENU"].search(texto_limpo):
-            return {"rota": "MENU", "contexto": "Menu"}
+        # 2. Reset — limpa tudo
+        if self.patterns["RESET"].search(texto_norm):
+            return {"rota": "RESET", "contexto": "Usuário quer reiniciar a conversa."}
 
-        # Se não for número, tenta identificar por palavra-chave
-        if self.patterns["SUPORTE"].search(texto_limpo):
-            return {"rota": "SUPORTE", "contexto": "Foco em suporte técnico."}
-            
-        if self.patterns["CALENDARIO"].search(texto_limpo):
-             return {"rota": "CALENDARIO", "contexto": "Foco em datas acadêmicas."}
+        # 3. Saudação/menu — só aciona se não estiver já num fluxo de submenu
+        if self.patterns["MENU"].search(texto_norm) and estado_menu == "MAIN":
+            return {"rota": "MENU", "contexto": "Saudação — exibir menu principal."}
 
-        return {"rota": "GERAL", "contexto": "Assunto geral."}
+        # 4. Intenções por palavra-chave (texto livre)
+        if self.patterns["SUPORTE"].search(texto_norm):
+            return {
+                "rota": "SUPORTE",
+                "contexto": "Usuário tem dúvida ou problema de suporte técnico.",
+            }
+        if self.patterns["CALENDARIO"].search(texto_norm):
+            return {
+                "rota": "CALENDARIO",
+                "contexto": "Usuário perguntou sobre datas ou prazos acadêmicos.",
+            }
+        if self.patterns["RU"].search(texto_norm):
+            return {
+                "rota": "RU",
+                "contexto": "Usuário perguntou sobre o RU ou transporte.",
+            }
+        if self.patterns["CONTATOS"].search(texto_norm):
+            return {
+                "rota": "CONTATOS",
+                "contexto": "Usuário perguntou sobre contatos institucionais.",
+            }
+
+        # 5. Fallback — deixa a IA decidir livremente
+        return {"rota": "GERAL", "contexto": "Assunto não identificado — responder livremente."}

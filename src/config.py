@@ -13,3 +13,5 @@ class Config:
     REDIS_URL = os.getenv("REDIS_URL")
     LLAMA_CLOUD_API_KEY = os.getenv("LLAMA_CLOUD_API_KEY")
 settings = Config()
+
+print(f"🔍 DEBUG DB_URL: {settings.DATABASE_URL}")

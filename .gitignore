@@ -6,7 +6,10 @@
 waha-data/
 pgdata/
 postgres_data/
-
+pg-data/
+pg-data-v2/
+pg-data-v3/
+pg-data*/
 # Python e Ambiente Virtual
 venv/
 __pycache__/
@@ -16,3 +19,7 @@ __pycache__/
 *.log
 .DS_Store
 .vscode/
+
+
+#arquivos de modo Dev
+src/gradio.py
