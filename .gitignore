@@ -23,3 +23,6 @@ __pycache__/
 
 #arquivos de modo Dev
 src/gradio.py
+
+#dados
+dados/*.pdf

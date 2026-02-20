@@ -1,138 +1,233 @@
 """
-router_service.py — RouterService revisado
+================================================================================
+router_service.py — Roteamento por Intenção (v4 — 3 PDFs)
+================================================================================
 
-Problemas corrigidos:
-  - Normalização de unicode ausente: "matrícula" não batia com "matricula"
-    (acentos do WhatsApp variavam dependendo do teclado do usuário)
-  - Padrão MENU conflitava com CALENDARIO ("data" capturava "boa data")
-  - OPCAO_* usavam search() mas os padrões tinham ^ e $ — deve ser match()
-  - Adicionado CONTATOS como rota própria (estava no menu mas não no router)
-  - Rota FALLBACK separada de GERAL para facilitar debug nos logs
-  - analisar() agora recebe estado do menu para evitar conflito de contexto
+RESUMO DAS MUDANÇAS NESTA VERSÃO:
+  - Rotas ativas: CALENDARIO, EDITAL, CONTATOS
+  - SUPORTE comentado (reativar com LLM superior + GLPI funcional)
+  - Adicionada rota EDITAL com palavras-chave do processo seletivo PAES
+  - Contextos mais específicos por rota para guiar a LLM na escolha da tool
+  - montar_prompt_enriquecido() mantido e ajustado para 3 rotas
+================================================================================
 """
 
 import re
 import unicodedata
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _normalizar(texto: str) -> str:
-    """Remove acentos e converte para minúsculas para comparação robusta."""
-    return unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode("utf-8").lower()
+    """
+    Remove acentos e converte para minúsculas.
+    Garante matching robusto independente de como o usuário digitou.
+    """
+    sem_acento = unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode("utf-8")
+    return sem_acento.lower()
 
 
 class RouterService:
     def __init__(self):
-        # Padrões aplicados sobre texto JÁ normalizado (sem acento, minúsculo)
         self.patterns = {
-            # Saudações e menu
-            "MENU": re.compile(
-                r"\b(oi|ola|bom dia|boa tarde|boa noite|ajuda|menu|inicio|start|help)\b"
-            ),
+
+            # ── Opções numéricas do menu principal ───────────────────────────
+            # match() garante que o texto INTEIRO seja apenas a opção.
+            # Ex: "2 de fevereiro" NÃO deve virar OPCAO_2.
+            "OPCAO_1": re.compile(r"^\s*(1|um|calendario|calendario academico)\s*$"),
+            "OPCAO_2": re.compile(r"^\s*(2|dois|edital|paes|processo seletivo|vestibular)\s*$"),
+            "OPCAO_3": re.compile(r"^\s*(3|tres|contatos?|emails?|telefones?)\s*$"),
+            # "OPCAO_4": re.compile(r"^\s*(4|quatro|suporte|ti|glpi|chamado)\s*$"),  ← futuro
+
+            # ── Reset / reinício ─────────────────────────────────────────────
             "RESET": re.compile(
-                r"\b(reiniciar|reset|limpar|recomecar|tchau|sair|cancelar)\b"
+                r"\b(reiniciar|reset|limpar|recomecar|tchau|sair|cancelar|voltar|inicio)\b"
             ),
 
-            # Opções numéricas do menu principal (prioridade máxima — testadas primeiro)
-            # match() garante que só captura se o texto INTEIRO for a opção
-            "OPCAO_1": re.compile(r"^\s*(1|um|calendario|datas?)\s*$"),
-            "OPCAO_2": re.compile(r"^\s*(2|dois|suporte|ti|glpi|chamado)\s*$"),
-            "OPCAO_3": re.compile(r"^\s*(3|tres|ru|restaurante|onibus|transporte)\s*$"),
-            "OPCAO_4": re.compile(r"^\s*(4|quatro|contatos?|emails?|telefones?)\s*$"),
-
-            # Intenções por palavras-chave (texto livre)
-            "SUPORTE": re.compile(
-                r"\b(glpi|chamado|suporte|computador|pc|notebook|net|wifi|wi.fi|"
-                r"impressora|login|senha|siguema|sistema|acesso|laboratorio)\b"
+            # ── Saudações ────────────────────────────────────────────────────
+            # Só ativa se a mensagem for APENAS uma saudação (sem pergunta junto).
+            # Ex: "oi" → MENU | "oi quando é a prova" → cai no CALENDARIO
+            "MENU": re.compile(
+                r"^\s*(oi|ola|bom dia|boa tarde|boa noite|ajuda|menu|start|help|"
+                r"oi tudo bem|oi boa tarde|oi bom dia|ola tudo bem)\s*$"
             ),
+
+            # ── Intenção: Calendário Acadêmico ───────────────────────────────
+            # Palavras de datas e eventos do calendário letivo.
+            # Nota: "data" sozinha não está aqui para evitar falso positivo.
             "CALENDARIO": re.compile(
-                r"\b(data|prazo|feriado|prova|matricula|rematricula|semestre|"
-                r"periodo|trancamento|calendario|aula|inicio|termino|retardatario|"
-                r"veterano|calouro|reingresso)\b"
+                r"\b(prazo|feriado|prova|matricula|rematricula|semestre|periodo|"
+                r"trancamento|calendario|inicio das aulas|termino das aulas|"
+                r"retardatario|veterano|calouro|reingresso|avaliacao|substitutiva|"
+                r"recesso|defesa|banca|2026\.1|2026\.2|primeiro semestre|"
+                r"segundo semestre|aula|letivo)\b"
             ),
-            "RU": re.compile(
-                r"\b(ru|restaurante|refeicao|comida|almoco|jantar|cardapio|"
-                r"onibus|transporte|rota|horario do onibus)\b"
+
+            # ── Intenção: Edital PAES 2026 ────────────────────────────────────
+            # Palavras ligadas ao processo seletivo, vagas e cotas.
+            "EDITAL": re.compile(
+                r"\b(edital|paes|vestibular|processo seletivo|inscricao|inscricoes|"
+                r"vaga|vagas|cota|cotas|ac|pcd|br-ppi|br-q|br-dc|ir-ppi|cfo-pp|"
+                r"ampla concorrencia|rede publica|quilombola|indigena|deficiencia|"
+                r"documentos|cronograma|resultado|classificacao|convocacao|"
+                r"heteroidentificacao|reserva de vaga|curso ofertado)\b"
             ),
+
+            # ── Intenção: Contatos ────────────────────────────────────────────
             "CONTATOS": re.compile(
-                r"\b(contato|email|e-mail|telefone|fone|ramal|prog|proexae|"
-                r"reitoria|ctic|departamento|coordenacao|secretaria)\b"
+                r"\b(contato|email|e-mail|telefone|fone|ramal|prog|proexae|prppg|prad|"
+                r"reitoria|ctic|departamento|coordenacao|secretaria|ouvidoria|"
+                r"pro-reitoria|pró-reitoria|cecen|cesb|cesc|ccsa|diretor|coordenador|"
+                r"central de atendimento|ti da uema|suporte uema)\b"
+            ),
+
+            # ── Intenção: Suporte Técnico (COMENTADO — futuro) ────────────────
+            # "SUPORTE": re.compile(
+            #     r"\b(glpi|chamado|suporte|computador|pc|notebook|impressora|"
+            #     r"internet|net|wifi|wi.fi|login|senha|siguema|sistema|acesso|"
+            #     r"laboratorio|monitor|teclado|mouse|projetor)\b"
+            # ),
+        }
+
+        # ── Contextos pré-definidos por rota ─────────────────────────────────
+        # Esses textos vão junto com o prompt para guiar a LLM a usar a tool certa.
+        self._contextos = {
+            "CALENDARIO": (
+                "O usuário tem uma dúvida sobre datas ou eventos do calendário acadêmico da UEMA 2026. "
+                "Use EXCLUSIVAMENTE a ferramenta 'consultar_calendario_academico'. "
+                "Passe palavras-chave específicas como query (ex: 'matricula veteranos 2026.1'). "
+                "Nunca invente datas — use apenas o que a ferramenta retornar."
+            ),
+            "EDITAL": (
+                "O usuário tem uma dúvida sobre o Edital do PAES 2026 (processo seletivo da UEMA). "
+                "Use EXCLUSIVAMENTE a ferramenta 'consultar_edital_paes_2026'. "
+                "Passe termos específicos como query (ex: 'vagas ampla concorrencia', 'documentos inscricao'). "
+                "Nunca invente regras ou números de vagas."
+            ),
+            "CONTATOS": (
+                "O usuário quer encontrar um contato, e-mail ou telefone da UEMA. "
+                "Use EXCLUSIVAMENTE a ferramenta 'consultar_contatos_uema'. "
+                "Passe o nome do setor ou cargo como query (ex: 'PROG pro-reitoria', 'CTIC TI'). "
+                "Nunca invente e-mails ou telefones."
+            ),
+            # "SUPORTE": (        ← futuro
+            #     "O usuário precisa de suporte técnico. Colete: tipo do problema, "
+            #     "local (sala/bloco) e nome completo. Use 'abrir_chamado_glpi'."
+            # ),
+            "MENU": (
+                "Exibir o menu principal com as opções disponíveis. Não use nenhuma ferramenta."
+            ),
+            "RESET": (
+                "Reiniciar a conversa e exibir o menu principal."
+            ),
+            "GERAL": (
+                "Assunto não identificado claramente. Responda com o que souber "
+                "ou oriente o usuário a usar o menu principal para escolher uma área."
             ),
         }
 
+    # =========================================================================
+    # Análise principal
+    # =========================================================================
+
     def analisar(self, texto: str, estado_menu: str = "MAIN") -> dict:
         """
-        Analisa o texto e retorna:
+        Identifica a intenção do usuário e retorna rota + contexto.
+
+        Parâmetros:
+          texto       : mensagem original do usuário
+          estado_menu : estado atual do MenuService (evita conflito de rota)
+
+        Retorno:
           {"rota": str, "contexto": str}
 
-        Parâmetro estado_menu: estado atual do MenuService.
-        Se o usuário já está num submenu, não redireciona para MENU novamente.
+        Prioridade:
+          1. Opções numéricas (match exato no texto inteiro)
+          2. Reset
+          3. Saudação (só se estiver no MAIN)
+          4. Palavras-chave por área (EDITAL antes de CALENDARIO para evitar
+             ambiguidade com "data de inscrição")
+          5. Fallback GERAL
         """
         texto_norm = _normalizar(texto.strip())
+        logger.debug("🔍 Router | texto: '%s' | estado: %s", texto_norm[:60], estado_menu)
 
-        # 1. Opções numéricas — prioridade máxima (match exato)
-        if self.patterns["OPCAO_1"].match(texto_norm):
-            return {
-                "rota": "CALENDARIO",
-                "contexto": (
-                    "O usuário escolheu Calendário Acadêmico. "
-                    "Pergunte de qual mês ou evento específico ele precisa. "
-                    "Não busque tudo de uma vez."
-                ),
-            }
-        if self.patterns["OPCAO_2"].match(texto_norm):
-            return {
-                "rota": "SUPORTE",
-                "contexto": (
-                    "O usuário escolheu Suporte Técnico. "
-                    "Pergunte qual o problema, o local e a urgência para abrir chamado no GLPI."
-                ),
-            }
-        if self.patterns["OPCAO_3"].match(texto_norm):
-            return {
-                "rota": "RU",
-                "contexto": (
-                    "O usuário escolheu RU e Transporte. "
-                    "Consulte regras do RU e rotas de ônibus na base de conhecimento."
-                ),
-            }
-        if self.patterns["OPCAO_4"].match(texto_norm):
-            return {
-                "rota": "CONTATOS",
-                "contexto": (
-                    "O usuário escolheu Contatos. "
-                    "Consulte e-mails e telefones na base de conhecimento."
-                ),
-            }
+        # ── 1. Opções numéricas ───────────────────────────────────────────────
+        for padrao, rota in [
+            ("OPCAO_1", "CALENDARIO"),
+            ("OPCAO_2", "EDITAL"),
+            ("OPCAO_3", "CONTATOS"),
+            # ("OPCAO_4", "SUPORTE"),   ← futuro
+        ]:
+            if self.patterns[padrao].match(texto_norm):
+                logger.info("🔢 Rota por opção numérica: %s", rota)
+                return {"rota": rota, "contexto": self._contextos[rota]}
 
-        # 2. Reset — limpa tudo
+        # ── 2. Reset ──────────────────────────────────────────────────────────
         if self.patterns["RESET"].search(texto_norm):
-            return {"rota": "RESET", "contexto": "Usuário quer reiniciar a conversa."}
+            logger.info("🔄 Rota RESET.")
+            return {"rota": "RESET", "contexto": self._contextos["RESET"]}
 
-        # 3. Saudação/menu — só aciona se não estiver já num fluxo de submenu
-        if self.patterns["MENU"].search(texto_norm) and estado_menu == "MAIN":
-            return {"rota": "MENU", "contexto": "Saudação — exibir menu principal."}
+        # ── 3. Saudação (só no MAIN) ──────────────────────────────────────────
+        if self.patterns["MENU"].match(texto_norm) and estado_menu == "MAIN":
+            logger.info("👋 Rota MENU (saudação).")
+            return {"rota": "MENU", "contexto": self._contextos["MENU"]}
 
-        # 4. Intenções por palavra-chave (texto livre)
-        if self.patterns["SUPORTE"].search(texto_norm):
-            return {
-                "rota": "SUPORTE",
-                "contexto": "Usuário tem dúvida ou problema de suporte técnico.",
-            }
+        # ── 4. Palavras-chave por área ────────────────────────────────────────
+        # EDITAL antes de CALENDARIO: "data de inscrição do PAES" → EDITAL
+        if self.patterns["EDITAL"].search(texto_norm):
+            logger.info("📋 Rota EDITAL por palavra-chave.")
+            return {"rota": "EDITAL", "contexto": self._contextos["EDITAL"]}
+
         if self.patterns["CALENDARIO"].search(texto_norm):
-            return {
-                "rota": "CALENDARIO",
-                "contexto": "Usuário perguntou sobre datas ou prazos acadêmicos.",
-            }
-        if self.patterns["RU"].search(texto_norm):
-            return {
-                "rota": "RU",
-                "contexto": "Usuário perguntou sobre o RU ou transporte.",
-            }
-        if self.patterns["CONTATOS"].search(texto_norm):
-            return {
-                "rota": "CONTATOS",
-                "contexto": "Usuário perguntou sobre contatos institucionais.",
-            }
+            logger.info("📅 Rota CALENDARIO por palavra-chave.")
+            return {"rota": "CALENDARIO", "contexto": self._contextos["CALENDARIO"]}
 
-        # 5. Fallback — deixa a IA decidir livremente
-        return {"rota": "GERAL", "contexto": "Assunto não identificado — responder livremente."}
+        if self.patterns["CONTATOS"].search(texto_norm):
+            logger.info("📞 Rota CONTATOS por palavra-chave.")
+            return {"rota": "CONTATOS", "contexto": self._contextos["CONTATOS"]}
+
+        # ── 5. Fallback ───────────────────────────────────────────────────────
+        logger.info("🌐 Rota GERAL (fallback).")
+        return {"rota": "GERAL", "contexto": self._contextos["GERAL"]}
+
+    # =========================================================================
+    # Montagem do prompt enriquecido
+    # =========================================================================
+
+    def montar_prompt_enriquecido(
+        self,
+        texto_usuario: str,
+        rota: dict,
+        contexto_usuario: dict = None,
+    ) -> str:
+        """
+        Monta o prompt completo para enviar ao agente LLM.
+
+        Combina:
+          - Orientação de rota (qual tool usar e como)
+          - Dados do usuário se disponíveis (nome, curso)
+          - Mensagem original do usuário
+
+        Isso elimina a ambiguidade do modelo: em vez de receber
+        só "quando é a prova?", ele recebe contexto completo que
+        o direciona para a ferramenta e query corretas.
+        """
+        linhas = ["[CONTEXTO DO ATENDIMENTO]"]
+        linhas.append(f"Área: {rota['rota']}")
+        linhas.append(f"Instrução: {rota['contexto']}")
+
+        if contexto_usuario:
+            if nome := contexto_usuario.get("nome"):
+                linhas.append(f"Nome do usuário: {nome}")
+            if curso := contexto_usuario.get("curso"):
+                linhas.append(f"Curso: {curso}")
+
+        linhas.append("")
+        linhas.append("[MENSAGEM DO USUÁRIO]")
+        linhas.append(texto_usuario)
+
+        prompt = "\n".join(linhas)
+        logger.debug("📝 Prompt enriquecido:\n%s", prompt)
+        return prompt

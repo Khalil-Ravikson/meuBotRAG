@@ -1,5 +1,20 @@
-import redis
+"""
+================================================================================
+main.py — v3: Logs limpos, endpoint /logs, LogService integrado
+================================================================================
+
+MELHORIAS v3:
+  1. Logging formatado de forma limpa: só o essencial no terminal
+  2. Suprime loggers barulhentos (httpcore, httpx, urllib3, groq debug)
+  3. LogService usado no startup para registrar inicialização
+  4. Endpoint /logs para visualizar erros recentes sem abrir o terminal
+  5. diagnose_banco() chamado automaticamente no startup (só em DEV_MODE)
+================================================================================
+"""
+
+import asyncio
 import logging
+import redis
 
 from fastapi import FastAPI, Request
 from src.config import settings
@@ -7,153 +22,150 @@ from src.services.rag_service import RagService
 from src.services.waha_service import WahaService
 from src.services.menu_service import MenuService
 from src.services.router_service import RouterService
+from src.handlers.webhook_handler import WebhookHandler
+from src.middleware.dev_guard import DevGuard
 from src.services.logger_service import LogService
-from src.services.redis_history import limpar_historico
 
-# --- SILENCIADOR DE LOG DO WEBHOOK ---
-class EndpointFilter(logging.Filter):
+# =============================================================================
+# Configuração de logging limpo
+# =============================================================================
+
+# Nível base: DEBUG em dev, INFO em prod
+_NIVEL_BASE = logging.DEBUG if getattr(settings, "DEV_MODE", True) else logging.INFO
+
+logging.basicConfig(
+    level=_NIVEL_BASE,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+
+# ── Suprime loggers muito verbosos que poluem o terminal ────────────────────
+# httpcore e httpx: mostram cada header HTTP — úteis só para debug de rede
+# urllib3: conexões internas do LangChain Smith
+# groq._base_client: request options gigantes com todo o payload
+_LOGGERS_SILENCIOSOS = [
+    "httpcore.http11",
+    "httpcore.connection",
+    "httpx",
+    "urllib3.connectionpool",
+    "groq._base_client",
+]
+for nome in _LOGGERS_SILENCIOSOS:
+    logging.getLogger(nome).setLevel(logging.WARNING)
+
+# Suprime log de acesso do Uvicorn para /webhook (muito repetitivo)
+class _EndpointFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return "/webhook" not in record.getMessage()
 
-logging.getLogger("uvicorn.access").addFilter(EndpointFilter())
+logging.getLogger("uvicorn.access").addFilter(_EndpointFilter())
 
-# --- INICIALIZAÇÃO ---
-app    = FastAPI()
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# Bootstrap dos serviços
+# =============================================================================
+
+app    = FastAPI(title="Bot UEMA", version="5.0")
 rag    = RagService()
 waha   = WahaService()
 menu   = MenuService()
 router = RouterService()
-logger = LogService()
+log    = LogService()
 
-# --- REDIS ---
+# Redis
 try:
     r = redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
     r.ping()
     print("✅ Redis conectado!")
-except Exception as e:
-    print("❌ ERRO CRÍTICO: Redis offline. Bot não iniciará.")
-    raise e
+except redis.ConnectionError as e:
+    raise RuntimeError(f"❌ Redis offline: {e}")
 
-# --- CONFIG ---
-DEV_MODE      = True
-DEV_WHITELIST = {"559887680098", "175174737518829"}  # set é O(1) no lookup
-
+guard   = DevGuard(r)
+handler = WebhookHandler(
+    rag_service    = rag,
+    waha_service   = waha,
+    menu_service   = menu,
+    router_service = router,
+)
 
 # =============================================================================
-# STARTUP
+# Startup
 # =============================================================================
+
 @app.on_event("startup")
-async def startup_event():
-    print(f"🚀 Bot iniciado! Modo DEV: {DEV_MODE}")
-    rag.inicializar()
-    await waha.configurar_webhook()
+async def startup():
+    print(f"🚀 Bot iniciado | DEV: {guard.dev_mode} | Whitelist: {guard.dev_whitelist}")
 
+    # Inicializa o RAG em thread separada para não bloquear o event loop
+    await asyncio.to_thread(rag.inicializar)
+
+    # Em modo dev, executa diagnóstico do banco para verificar sources
+    if guard.dev_mode:
+        await asyncio.to_thread(rag.diagnose_banco)
+
+    await waha.inicializar()
+    log.log_info("SYSTEM", "Startup completo", f"dev_mode={guard.dev_mode}")
 
 # =============================================================================
-# WEBHOOK
+# Endpoints
 # =============================================================================
+
 @app.post("/webhook")
 async def webhook(request: Request):
-    chat_id      = None
-    sender_phone = None
+    data = await request.json()
 
+    aprovado, resultado = await guard.validar(data)
+    if not aprovado:
+        logger.debug("🚫 Bloqueado: %s", resultado)
+        return {"status": resultado}
+
+    await handler.processar(resultado)
+    return {"status": "ok"}
+
+
+@app.get("/health")
+async def health():
+    """Verifica saúde dos serviços principais."""
     try:
-        data = await request.json()
+        r.ping()
+        redis_ok = True
+    except Exception:
+        redis_ok = False
 
-        # 1. Filtro de evento
-        if data.get("event") != "message":
-            return {"status": "ignored_event"}
+    return {
+        "status":   "ok" if redis_ok else "degraded",
+        "redis":    "online" if redis_ok else "offline",
+        "agente":   "pronto" if rag.agent_with_history else "inicializando",
+        "dev_mode": guard.dev_mode,
+    }
 
-        payload = data.get("payload")
-        if not payload or payload.get("fromMe") is True:
-            return {"status": "ignored_self"}
 
-        # 2. Extração
-        chat_id      = payload.get("from", "")
-        sender_phone = chat_id.split("@")[0]
-        event_id     = data.get("id") or payload.get("id")
-        body         = (payload.get("body") or "").strip()
+@app.get("/logs")
+async def get_logs(limit: int = 20):
+    """
+    Retorna os últimos erros registrados pelo LogService.
+    Útil para debug sem precisar abrir o terminal do Docker.
 
-        # 3. Bloqueios
-        if "@g.us" in chat_id or "status@broadcast" in chat_id:
-            return {"status": "ignored_group"}
+    Acesse: http://localhost:8000/logs
+    """
+    erros = log.get_recent_errors(limit)
+    return {
+        "total":  len(erros),
+        "errors": erros,
+    }
 
-        if DEV_MODE and sender_phone not in DEV_WHITELIST:
-            return {"status": "ignored_dev"}
 
-        # 4. Deduplicação
-        if r.get(f"evt:{event_id}"):
-            return {"status": "ignored_duplicate"}
-        r.setex(f"evt:{event_id}", 300, "1")
+@app.get("/banco/sources")
+async def banco_sources():
+    """
+    Mostra quais 'source' estão presentes no banco vetorial.
+    Use para verificar se os nomes dos PDFs batem com PDF_CONFIG.
 
-        # 5. Rate limit — 5 msgs / 10s por número
-        key_rate = f"rate:{sender_phone}"
-        count = r.incr(key_rate)
-        if count == 1:
-            r.expire(key_rate, 10)
-        if count > 5:
-            return {"status": "rate_limited"}
-
-        # 6. Ignora vazio e mídia
-        if not body or payload.get("hasMedia", False):
-            return {"status": "ignored_content"}
-
-        # =====================================================================
-        # 🚦 ROTEAMENTO HIERÁRQUICO
-        #
-        # Ordem de decisão:
-        #   MenuService  →  resposta fixa de menu (zero tokens)
-        #   RouterService → enriquece prompt com contexto de rota
-        #   RagService   →  chama a IA com prompt enriquecido
-        # =====================================================================
-
-        estado_atual = menu.get_user_state(sender_phone)
-        decisao      = menu.processar_escolha(sender_phone, body)
-
-        # --- Resposta de menu fixo (sem IA) ---
-        if decisao["type"] == "msg":
-            await waha.enviar_mensagem(chat_id, decisao["content"])
-            return {"status": "menu_ok"}
-
-        # --- Ação: enriquece o prompt via RouterService ---
-        prompt_base = decisao["prompt"]
-        rota        = router.analisar(prompt_base, estado_menu=estado_atual)
-
-        # RESET: limpa histórico Redis e exibe menu
-        if rota["rota"] == "RESET":
-            limpar_historico(sender_phone)
-            menu.clear_user_state(sender_phone)
-            await waha.enviar_mensagem(chat_id, menu.menus["MAIN"]["msg"])
-            return {"status": "reset_ok"}
-
-        # Adiciona contexto de rota como instrução invisível para a IA
-        if rota["rota"] != "GERAL":
-            prompt_final = f"[CONTEXTO: {rota['contexto']}]\n{prompt_base}"
-        else:
-            prompt_final = prompt_base
-
-        print(f"🤖 [{rota['rota']}] {sender_phone}: {prompt_base[:60]}...")
-
-        # --- Chama a IA ---
-        resposta = rag.responder(prompt_final, user_id=sender_phone)
-        await waha.enviar_mensagem(chat_id, resposta)
-
-        return {"status": "processed"}
-
-    except Exception as e:
-        erro_str = str(e)
-        phone_log = sender_phone or "unknown"
-        print(f"❌ Erro crítico [{phone_log}]: {erro_str}")
-        logger.log_error(phone_log, "WEBHOOK_CRITICAL", erro_str)
-
-        # Tenta avisar o usuário — silencia se waha também falhar
-        if chat_id:
-            try:
-                await waha.enviar_mensagem(
-                    chat_id,
-                    "Estou com uma instabilidade momentânea. Tente novamente em 1 minuto. 🙏"
-                )
-            except Exception:
-                pass
-
-        return {"status": "error_handled"}
+    Acesse: http://localhost:8000/banco/sources
+    """
+    sources = await asyncio.to_thread(rag.diagnose_banco)
+    return {
+        "sources_no_banco": list(sources),
+        "sources_esperados": list(rag.PDF_CONFIG.keys()) if hasattr(rag, "PDF_CONFIG") else [],
+    }
