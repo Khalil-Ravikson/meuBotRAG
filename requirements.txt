@@ -6,6 +6,7 @@ python-dotenv
 python-multipart
 nest_asyncio
 httpx>=0.24.0
+pydantic-settings
 
 # --- Stack LangChain (Estável 0.2.x) ---
 langchain==0.2.16
@@ -23,8 +24,13 @@ redis
 llama-parse
 pymupdf
 sentence-transformers
+tiktoken
 
 # --- Banco de Dados ---
 psycopg[binary]
 sqlalchemy
 pgvector
+psycopg-pool
+
+# --- Interface & Debug ---
+chainlit

@@ -1,66 +1,136 @@
 version: '3.8'
 
+# =============================================================================
+# COMO O .env FUNCIONA NESTE ARQUIVO
+# =============================================================================
+#
+# O Docker Compose lê o .env automaticamente — você não precisa fazer nada.
+# Ele serve para DUAS coisas diferentes ao mesmo tempo:
+#
+#  1) Interpolação no docker-compose.yml → ${VARIAVEL}
+#     Antes de subir os containers, o Compose substitui ${DB_USER} pelo valor
+#     que está no seu .env. Por isso DATABASE_URL pode ser montada dinamicamente.
+#
+#  2) Injeção dentro do container → env_file: .env
+#     O arquivo .env completo é passado para DENTRO do container como variáveis
+#     de ambiente. É isso que permite o settings.py ler GROQ_API_KEY etc.
+#
+# POR QUE ALGUMAS VARIÁVEIS APARECEM EM `environment:` E NÃO SÓ NO `env_file:`?
+#
+#   DATABASE_URL, REDIS_URL e WAHA_BASE_URL usam NOMES DE SERVIÇO Docker
+#   (db, redis, waha) como host — não "localhost".
+#   O .env do seu computador tem "localhost" (para dev local sem Docker).
+#   Por isso sobrescrevemos essas três aqui para o ambiente Docker correto.
+#
+# O env_file: passa tudo que restou (GROQ_API_KEY, HF_TOKEN, etc.)
+# =============================================================================
+
 services:
-  # --- 1. WHATSAPP ENGINE ---
+
+  # ---------------------------------------------------------------------------
+  # 1. WAHA — Motor do WhatsApp (envia/recebe mensagens)
+  # ---------------------------------------------------------------------------
   waha:
     image: devlikeapro/waha
     container_name: waha
-    restart: always
+    restart: unless-stopped
     ports:
       - "3000:3000"
     environment:
-      - WHATSAPP_DEFAULT_ENGINE=NOWEB
+      - WHATSAPP_DEFAULT_ENGINE=WEBJS
       - WAHA_API_KEY=${WAHA_API_KEY}
       - WAHA_DASHBOARD_USERNAME=admin
       - WAHA_DASHBOARD_PASSWORD=${WAHA_DASHBOARD_PASS}
     volumes:
       - ./waha-data:/app/.sessions
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
-  # --- 2. BANCO DE DADOS VETORIAL ---
+  # ---------------------------------------------------------------------------
+  # 2. pgvector — Banco de dados vetorial (PostgreSQL + extensão pgvector)
+  # ---------------------------------------------------------------------------
   db:
     image: pgvector/pgvector:pg16
     container_name: vectordb
-    restart: always
+    restart: unless-stopped
     environment:
       - POSTGRES_USER=${DB_USER}
       - POSTGRES_PASSWORD=${DB_PASS}
-      - POSTGRES_DB=${DB_NAME}  
-    ports:                    
-      - "5433:5432"
+      - POSTGRES_DB=${DB_NAME}
+    ports:
+      - "5433:5432"     # porta 5433 no host para não conflitar com Postgres local
     volumes:
       - ./pg-data-v3:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-    # Não expus a porta 5432 para o host para evitar conflitos,
-    # a comunicação é interna via rede Docker.
+  # ---------------------------------------------------------------------------
+  # 3. Redis — Histórico de conversas + cache + deduplicação
+  # ---------------------------------------------------------------------------
   redis:
     image: redis:alpine
     container_name: redis-cache
-    restart: always
+    restart: unless-stopped
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
-  # --- 3. SEU BOT INTELIGENTE ---
+  # ---------------------------------------------------------------------------
+  # 4. Bot RAG — A aplicação principal
+  # ---------------------------------------------------------------------------
   bot:
     build: .
     container_name: bot-rag
-    restart: always
+    restart: unless-stopped
+
+    # `condition: service_healthy` significa que o bot só inicia depois que
+    # db e redis passarem no healthcheck — resolve o erro de conexão no startup
     depends_on:
-      - waha
-      - db # Espera o banco iniciar
-      - redis # <--- O Bot agora espera o Redis ligar
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      waha:
+        condition: service_started   # WAHA demora para ter /health disponível
+
     ports:
-      - "8000:8000" # Porta para o Ngrok
+      - "8000:8000"
+
     volumes:
-      - .:/app
-      - ./src:/app/src     # Hot-reload
-      - ./dados:/app/dados # Acesso ao PDF
+      - ./dados:/app/dados           # PDFs para ingestão (sempre necessário)
+      - ./src:/app/src               # hot-reload em desenvolvimento
+      # Em produção: remova a linha acima e reconstrua a imagem com `docker-compose build`
+
+    # ── env_file: injeta o .env inteiro dentro do container ──────────────────
+    # O settings.py (pydantic-settings) lê as variáveis daqui.
+    # Tudo que não for sobrescrito em `environment:` vem do .env.
+    env_file:
+      - .env
+
+    # ── environment: sobrescreve apenas o que muda no ambiente Docker ─────────
+    # Hosts são nomes de serviços Docker, não "localhost".
+    # Essas três linhas sobrescrevem o que veio do env_file acima.
     environment:
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - WAHA_API_KEY=${WAHA_API_KEY}
-      # URL interna do Docker para o WAHA
-      - WAHA_BASE_URL=${WAHA_BASE_URL}
-      # URL interna do Docker para o Banco
       - DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
-          
-      - REDIS_URL=${REDIS_URL}
-      - LLAMA_CLOUD_API_KEY=${LLAMA_CLOUD_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - WAHA_BASE_URL=http://waha:3000
+      - WHATSAPP_HOOK_URL=http://bot-rag:8000/webhook
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s  # tempo para ingestão de PDFs no startup

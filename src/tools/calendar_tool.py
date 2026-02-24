@@ -1,70 +1,43 @@
 """
-================================================================================
-tool_calendario.py — Tool de Consulta ao Calendário Acadêmico
-================================================================================
+tools/tool_calendario.py — Tool de Consulta ao Calendário Acadêmico
+====================================================================
+CORREÇÃO CRÍTICA vs versão anterior:
+  SOURCE_CALENDARIO era "calendario_academico.pdf" (underscore)
+  mas o arquivo real é "calendario-academico-2026.pdf" (hífen + ano).
+  Isso causava o "Não encontrei" mesmo com o banco populado.
 
-RESUMO:
-  Consulta datas, prazos e eventos do calendário acadêmico da UEMA 2026.
-  Usa retriever filtrado EXCLUSIVAMENTE no PDF do calendário.
-
-  Por que filtrar por source:
-    Sem filtro, o retriever pode trazer chunks do edital ou de contatos
-    quando a pergunta menciona palavras como "data" ou "prazo".
-
-SOBRE O PDF DO CALENDÁRIO:
-  PDFs de calendário da UEMA costumam ter tabelas mensais com:
-    - Coluna de datas (dia/mês)
-    - Coluna de eventos (ex: "Início das aulas", "Feriado estadual")
-    - Coluna de semestre (2026.1 / 2026.2)
-
-  O LlamaParse com result_type="markdown" converte bem essas tabelas simples.
-  A pré-formatação em rag_service.py transforma cada linha em:
-    "EVENTO: Início das aulas | DATA: 10/02/2026 | SEM: 2026.1"
-  Isso melhora muito a precisão do embedding.
-
-TOOLS COMENTADAS (para implementação futura com LLM superior):
-  - Resposta livre a qualquer pergunta
-  - Busca por múltiplos semestres simultaneamente
-================================================================================
+  ⚠️  Confirme o nome exato via Ingestor().diagnosticar() após a ingestão.
+      O valor abaixo DEVE ser idêntico à chave em rag/ingestor.py:PDF_CONFIG.
 """
-
+from __future__ import annotations
 import unicodedata
 import logging
 from langchain_core.tools import tool
-from src.services.db_service import get_vector_store
+from src.rag.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
 
-# Limite de caracteres na resposta.
-# ~1200 chars cobre 3-4 eventos do calendário com datas completas.
 MAX_CHARS = 1200
 
-# Nome exato do arquivo PDF do calendário (deve coincidir com o metadado 'source')
-SOURCE_CALENDARIO = "calendario_academico.pdf"
+# ⚠️  Deve bater EXATAMENTE com a chave em rag/ingestor.py:PDF_CONFIG
+SOURCE_CALENDARIO = "calendario-academico-2026.pdf"
 
 
 def _normalizar(texto: str) -> str:
-    """
-    Remove acentos e coloca em minúsculas.
-    Garante que "matrícula" == "matricula" no matching do retriever.
-    """
-    sem_acento = unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode("utf-8")
-    return sem_acento.lower().strip()
+    s = unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode("utf-8")
+    return s.lower().strip()
 
 
 def get_tool_calendario():
-    """
-    Fábrica da tool de calendário acadêmico.
-    Configura e retorna a @tool com retriever especializado.
-    """
-    vectorstore = get_vector_store()
+    """Fábrica: configura e retorna a @tool com retriever especializado."""
+    vectorstore = get_vector_store()  # singleton — sem custo adicional
 
     retriever = vectorstore.as_retriever(
         search_type="mmr",
         search_kwargs={
-            "k": 4,           # retorna até 4 chunks mais relevantes
-            "fetch_k": 25,    # avalia 25 candidatos antes de selecionar os 4
-            "lambda_mult": 0.75,  # 75% relevância, 25% diversidade
+            "k": 4,
+            "fetch_k": 25,
+            "lambda_mult": 0.75,   # 75% relevância, 25% diversidade
             "filter": {"source": SOURCE_CALENDARIO},
         },
     )
@@ -102,20 +75,17 @@ def get_tool_calendario():
                     "trancamento, início das aulas, semestre."
                 )
 
-            # Log de debug: mostra os chunks encontrados
             for i, doc in enumerate(docs):
                 logger.debug(
-                    "📅 Chunk %d | source: %s | prévia: %s",
+                    "📅 Chunk %d | source: %s | %s",
                     i + 1,
                     doc.metadata.get("source", "?"),
-                    doc.page_content[:100].replace("\n", " "),
+                    doc.page_content[:80].replace("\n", " "),
                 )
 
-            # Monta resposta com separador claro entre chunks
             blocos = [doc.page_content.strip() for doc in docs if doc.page_content.strip()]
             resposta = "\n---\n".join(blocos)
 
-            # Trunca se necessário (segurança para não estourar contexto)
             if len(resposta) > MAX_CHARS:
                 resposta = resposta[:MAX_CHARS] + "\n[...resultado truncado]"
 

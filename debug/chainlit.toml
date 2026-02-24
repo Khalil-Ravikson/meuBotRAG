@@ -1,0 +1,61 @@
+# =============================================================================
+# debug/chainlit.toml — Configuração visual do painel de debug
+# =============================================================================
+#
+# O QUE É UM ARQUIVO TOML?
+# ─────────────────────────
+# TOML (Tom's Obvious Minimal Language) é um formato de configuração legível.
+# Similar a .ini mas com tipos: string, int, bool, lista, tabela.
+# É o mesmo formato do pyproject.toml que o pip usa.
+#
+# Exemplo de sintaxe:
+#   [secao]
+#   chave_string  = "valor"
+#   chave_inteiro = 42
+#   chave_bool    = true
+#   chave_lista   = ["a", "b", "c"]
+#
+# ESTE ARQUIVO VAI PARA O DOCKER?
+# ────────────────────────────────
+# NÃO. Só afeta o Chainlit, que é ferramenta de dev.
+# O Docker roda a API FastAPI (src/main.py), que não usa Chainlit.
+#
+# ARQUIVOS TOML DO SEU PROJETO:
+#   pyproject.toml        → raiz/, vai ao git, usado pelo pip/pytest
+#   debug/chainlit.toml   → só dev, NÃO entra no Dockerfile
+#
+# COMO O CHAINLIT ENCONTRA ESTE ARQUIVO:
+# O Chainlit procura o chainlit.toml na MESMA PASTA do .py que você rodou.
+# Como você roda:
+#   chainlit run debug/debug_chainlit.py --port 8001
+# Ele vai procurar em debug/chainlit.toml → encontra este arquivo. ✅
+# =============================================================================
+
+[project]
+# Nome exibido no topo do painel
+name = "UEMA Bot — Debug"
+
+# Desativa feedback humano (polegar para cima/baixo — desnecessário no debug)
+enable_human_feedback = false
+
+[UI]
+# Tema padrão: "light" ou "dark"
+default_theme = "dark"
+
+# hide_cot = false → MOSTRA os Steps internos (chain of thought)
+# Isso é o que exibe "🤖 Agent [CALENDARIO] · Latência: 1200ms" no painel
+# Em produção seria true para esconder do usuário final
+hide_cot = false
+
+# Ícone no topo (emoji ou URL de imagem)
+# logo = "https://uema.br/favicon.ico"
+
+[features]
+# Upload de arquivos no chat (desativado — não necessário no debug)
+multi_modal = false
+
+# Mantém a conversa ao recarregar a página
+spontaneous_file_upload = false
+
+[meta]
+description = "Painel de debug interno — Agente UEMA"
