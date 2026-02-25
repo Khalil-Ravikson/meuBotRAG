@@ -28,19 +28,14 @@ from src.memory.redis_memory import (
     get_estado_menu, set_estado_menu, clear_estado_menu,
     get_contexto, set_contexto,
 )
-from src.services.waha_service import WahaService
+from src.services.evolution_service import EvolutionService # Modificado aqui
 from src.infrastructure.settings import settings
 
 logger = logging.getLogger(__name__)
 
-
-async def handle_message(mensagem: Mensagem, waha: WahaService) -> None:
+async def handle_message(mensagem: Mensagem, api_service: EvolutionService) -> None: # Modificado aqui
     """
-    Processa uma mensagem recebida e envia a resposta via WAHA.
-
-    Parâmetros:
-      mensagem : Mensagem (domain entity)
-      waha     : WahaService (injetado)
+    Processa uma mensagem recebida e envia a resposta.
     """
     user_id = mensagem.user_id
     body    = mensagem.body
@@ -51,20 +46,20 @@ async def handle_message(mensagem: Mensagem, waha: WahaService) -> None:
 
     logger.info("📨 [%s] '%s'", user_id, body[:80])
 
-    # ── 1. Carrega estado do menu do Redis ────────────────────────────────────
+    # 1. Carrega estado do menu do Redis
     estado_atual = get_estado_menu(user_id)
 
-    # ── 2. domain/menu.py (stateless): decide o tipo de resposta ─────────────
+    # 2. domain/menu.py (stateless): decide o tipo de resposta
     resultado = processar_mensagem(body, estado_atual)
 
-    # ── 3. Resposta direta do menu (sem LLM) ──────────────────────────────────
+    # 3. Resposta direta do menu (sem LLM)
     if resultado["type"] in ("menu_principal", "submenu"):
         novo_estado = resultado["novo_estado"]
         set_estado_menu(user_id, novo_estado)
-        await waha.enviar_mensagem(mensagem.chat_id, resultado["content"])
+        await api_service.enviar_mensagem(mensagem.chat_id, resultado["content"])
         return
 
-    # ── 4. Atualiza estado do menu (limpa para MAIN após ação do submenu) ─────
+    # 4. Atualiza estado do menu
     novo_estado = resultado["novo_estado"]
     if novo_estado != estado_atual:
         if novo_estado == EstadoMenu.MAIN:
@@ -72,7 +67,7 @@ async def handle_message(mensagem: Mensagem, waha: WahaService) -> None:
         else:
             set_estado_menu(user_id, novo_estado)
 
-    # ── 5. Determina rota e monta prompt enriquecido ──────────────────────────
+    # 5. Determina rota e monta prompt enriquecido
     prompt_base = resultado["prompt"] or body
     rota        = analisar(prompt_base, estado_atual)
     ctx_usuario = get_contexto(user_id)
@@ -83,7 +78,7 @@ async def handle_message(mensagem: Mensagem, waha: WahaService) -> None:
         contexto_usuario = ctx_usuario,
     )
 
-    # ── 6. Cria AgentState ────────────────────────────────────────────────────
+    # 6. Cria AgentState
     state = AgentState(
         user_id            = user_id,
         session_id         = user_id,  # 1 sessão por usuário
@@ -96,13 +91,13 @@ async def handle_message(mensagem: Mensagem, waha: WahaService) -> None:
         max_iteracoes      = settings.AGENT_MAX_ITERATIONS,
     )
 
-    # ── 7. Agente gera a resposta ─────────────────────────────────────────────
+    # 7. Agente gera a resposta
     logger.info("🤖 [%s] rota=%s → AgentCore", user_id, rota.value)
     resposta_obj = agent_core.responder(state)
 
-    # ── 8. Persiste contexto (última intenção) ────────────────────────────────
+    # 8. Persiste contexto (última intenção)
     set_contexto(user_id, {"ultima_intencao": rota.value})
 
-    # ── 9. Envia resposta ─────────────────────────────────────────────────────
+    # 9. Envia resposta
     conteudo = resposta_obj.conteudo or "Desculpe, não consegui processar sua solicitação."
-    await waha.enviar_mensagem(mensagem.chat_id, conteudo)
+    await api_service.enviar_mensagem(mensagem.chat_id, conteudo)

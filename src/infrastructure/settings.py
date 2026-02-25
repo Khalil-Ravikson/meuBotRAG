@@ -40,12 +40,17 @@ class Settings(BaseSettings):
     # ── Redis ─────────────────────────────────────────────────────────────────
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # ── WAHA (WhatsApp) ───────────────────────────────────────────────────────
-    WAHA_API_KEY:      str = ""
-    WAHA_BASE_URL:     str = "http://waha:3000"
-    WAHA_SESSION:      str = "default"
-    WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
+    # ── WAHA (DESCONTINUADO) ───────────────────────────────────────────────────────
+    # WAHA_API_KEY:      str = ""
+    # WAHA_BASE_URL:     str = "http://waha:3000"
+    # WAHA_SESSION:      str = "default"
+    # WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
 
+    # ── EVOLUTION (WhatsApp) ───────────────────────────────────────────────────────
+    EVOLUTION_BASE_URL: str
+    EVOLUTION_API_KEY: str
+    EVOLUTION_INSTANCE_NAME: str = "default"
+    WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
     # ── Agente ────────────────────────────────────────────────────────────────
     AGENT_MAX_ITERATIONS: int = 3
     AGENT_TIMEOUT_S:      int = 25

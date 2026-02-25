@@ -22,7 +22,7 @@ from src.infrastructure.redis_client import get_redis, redis_ok
 from src.infrastructure.observability import obs
 from src.agent.core import agent_core
 from src.middleware.dev_guard import DevGuard
-from src.services.waha_service import WahaService
+from src.services.evolution_service import EvolutionService
 from src.application.handle_webhook import handle_webhook
 from src.rag.ingestor import Ingestor
 from src.tools import get_tools_ativas
@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 app   = FastAPI(title="Bot UEMA", version="2.0")
-waha  = WahaService()
+api_service = EvolutionService()
 guard = DevGuard(get_redis())
 
 # =============================================================================
@@ -82,8 +82,10 @@ async def startup():
     await asyncio.to_thread(agent_core.inicializar, tools)
 
     # 4. Conecta e configura o webhook do WAHA
-    await waha.inicializar()
-
+    #await waha.inicializar()
+    await api_service.inicializar()
+    
+    
     obs.info("SYSTEM", "Startup", f"DEV={settings.DEV_MODE} | tools={len(tools)}")
     logger.info("✅ Bot pronto!")
 
@@ -93,8 +95,8 @@ async def startup():
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    payload   = await request.json()
-    resultado = await handle_webhook(payload, guard, waha)
+    payload = await request.json()
+    resultado = await handle_webhook(payload, guard, api_service)
     return JSONResponse(content=resultado)
 
 

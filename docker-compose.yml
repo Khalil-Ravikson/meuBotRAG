@@ -17,8 +17,8 @@ version: '3.8'
 #
 # POR QUE ALGUMAS VARIÁVEIS APARECEM EM `environment:` E NÃO SÓ NO `env_file:`?
 #
-#   DATABASE_URL, REDIS_URL e WAHA_BASE_URL usam NOMES DE SERVIÇO Docker
-#   (db, redis, waha) como host — não "localhost".
+#   DATABASE_URL, REDIS_URL e EVOLUTION_BASE_URL usam NOMES DE SERVIÇO Docker
+#   (db, redis, evolution-api) como host — não "localhost".
 #   O .env do seu computador tem "localhost" (para dev local sem Docker).
 #   Por isso sobrescrevemos essas três aqui para o ambiente Docker correto.
 #
@@ -26,25 +26,36 @@ version: '3.8'
 # =============================================================================
 
 services:
-
   # ---------------------------------------------------------------------------
-  # 1. WAHA — Motor do WhatsApp (envia/recebe mensagens)
+  # 1. Evolution API v2 — Novo Motor do WhatsApp
   # ---------------------------------------------------------------------------
-  waha:
-    image: devlikeapro/waha
-    container_name: waha
+  evolution-api:
+    image: atendai/evolution-api:v2.1.1
+    container_name: evolution_api
     restart: unless-stopped
     ports:
-      - "3000:3000"
+      - "8080:8080"
     environment:
-      - WHATSAPP_DEFAULT_ENGINE=WEBJS
-      - WAHA_API_KEY=${WAHA_API_KEY}
-      - WAHA_DASHBOARD_USERNAME=admin
-      - WAHA_DASHBOARD_PASSWORD=${WAHA_DASHBOARD_PASS}
+      - SERVER_URL=http://localhost:8080
+      - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      # 👇 Configurações de Banco de Dados (usando o seu pgvector)
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}?schema=evolution
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution_api
+      # 👇 Configurações de Cache (usando o seu Redis)
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://redis:6379/1
+      - CACHE_REDIS_PREFIX_KEY=evolution
+      # 👇 Webhook
+      - WEBHOOK_GLOBAL_URL=http://bot-rag:8000/webhook
+      - WEBHOOK_GLOBAL_ENABLED=true
+      - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+      - CONFIG_SESSION_PHONE_VERSION=2.3000.1032691661
+      
     volumes:
-      - ./waha-data:/app/.sessions
+      - ./evolution_instances:/evolution/instances
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:3000/api/health || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -102,8 +113,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
-      waha:
-        condition: service_started   # WAHA demora para ter /health disponível
+      evolution-api:
+        condition: service_started   # Agora espera a Evolution API iniciar
 
     ports:
       - "8000:8000"
@@ -121,11 +132,12 @@ services:
 
     # ── environment: sobrescreve apenas o que muda no ambiente Docker ─────────
     # Hosts são nomes de serviços Docker, não "localhost".
-    # Essas três linhas sobrescrevem o que veio do env_file acima.
+    # Estas três linhas sobrescrevem o que veio do env_file acima.
     environment:
       - DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
       - REDIS_URL=redis://redis:6379/0
-      - WAHA_BASE_URL=http://waha:3000
+      # 👇 Atualizado para Evolution API
+      - EVOLUTION_BASE_URL=http://evolution-api:8080
       - WHATSAPP_HOOK_URL=http://bot-rag:8000/webhook
 
     healthcheck:
