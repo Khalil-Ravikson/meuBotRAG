@@ -8,11 +8,11 @@ Importe em qualquer lugar:
 """
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
+import os
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=os.getenv("ENV_FILE_PATH", ".env"),
         env_file_encoding="utf-8",
         case_sensitive=False,
         extra="ignore",
@@ -20,8 +20,8 @@ class Settings(BaseSettings):
 
     # ── LLM (Groq) ────────────────────────────────────────────────────────────
     GROQ_API_KEY:    str   = ""
-    GROQ_MODEL:      str   = "llama-3.3-70b-versatile"
-    GROQ_TEMP:       float = 0.1
+    GROQ_MODEL:      str   = "llama-3.1-8b-instant"
+    GROQ_TEMP:       float = 0.3
     GROQ_MAX_TOKENS: int   = 1024
 
     # ── HuggingFace ───────────────────────────────────────────────────────────
@@ -52,9 +52,9 @@ class Settings(BaseSettings):
     EVOLUTION_INSTANCE_NAME: str = "default"
     WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
     # ── Agente ────────────────────────────────────────────────────────────────
-    AGENT_MAX_ITERATIONS: int = 3
-    AGENT_TIMEOUT_S:      int = 25
-    MAX_HISTORY_MESSAGES: int = 6
+    AGENT_MAX_ITERATIONS: int = 6
+    AGENT_TIMEOUT_S:      int = 45
+    MAX_HISTORY_MESSAGES: int = 8
 
     # ── LangSmith (observabilidade LangChain) ─────────────────────────────────
     # Rastreia chamadas do agente, tokens, tools, latência no dashboard.

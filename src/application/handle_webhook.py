@@ -1,8 +1,12 @@
 """
-application/handle_webhook.py — Extração e validação do payload WAHA
-=====================================================================
+application/handle_webhook.py — Extração e validação do payload (v2 — Evolution API)
+=====================================================================================
 Recebe o payload bruto do FastAPI, valida com DevGuard,
 converte para Mensagem (domain entity) e chama handle_message.
+
+MIGRAÇÃO WAHA → EVOLUTION:
+  - WahaService substituído por EvolutionService
+  - identity agora inclui "push_name" (nome do contato no WhatsApp)
 """
 from __future__ import annotations
 import logging
@@ -14,12 +18,18 @@ from src.services.evolution_service import EvolutionService
 
 logger = logging.getLogger(__name__)
 
+
 async def handle_webhook(
     payload: dict,
     guard: DevGuard,
-    api_service: EvolutionService,  # Modificado aqui
+    evolution: EvolutionService,
 ) -> dict:
-    
+    """
+    Ponto de entrada de toda mensagem recebida.
+
+    Retorna:
+      {"status": "ok"} sempre (Evolution não precisa de resposta específica)
+    """
     ok, resultado = await guard.validar(payload)
 
     if not ok:
@@ -33,8 +43,8 @@ async def handle_webhook(
         chat_id   = identity["chat_id"],
         body      = identity.get("body", ""),
         has_media = identity.get("has_media", False),
-        msg_type  = identity.get("msg_type", "text"),
+        msg_type  = identity.get("msg_type", "conversation"),
     )
 
-    await handle_message(mensagem, api_service)
+    await handle_message(mensagem, evolution)
     return {"status": "ok"}

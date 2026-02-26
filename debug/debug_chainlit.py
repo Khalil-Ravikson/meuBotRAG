@@ -96,6 +96,7 @@ _MODULOS_OK  = True
 _ERRO_IMPORT = None
 try:
     from src.infrastructure.settings     import settings
+    print("DEBUG DATABASE_URL:", settings.DATABASE_URL)
     from src.infrastructure.observability import obs
     from src.agent.core                  import agent_core
     from src.agent.state                 import AgentState
