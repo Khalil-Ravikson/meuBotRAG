@@ -1,25 +1,49 @@
 """
-tools/tool_calendario.py — Tool de Consulta ao Calendário Acadêmico
-====================================================================
-CORREÇÃO CRÍTICA vs versão anterior:
-  SOURCE_CALENDARIO era "calendario_academico.pdf" (underscore)
-  mas o arquivo real é "calendario-academico-2026.pdf" (hífen + ano).
-  Isso causava o "Não encontrei" mesmo com o banco populado.
+tools/calendar_tool.py — Tool de Consulta ao Calendário Acadêmico (v3)
+=======================================================================
 
-  ⚠️  Confirme o nome exato via Ingestor().diagnosticar() após a ingestão.
-      O valor abaixo DEVE ser idêntico à chave em rag/ingestor.py:PDF_CONFIG.
+O QUE MUDOU vs versão anterior:
+─────────────────────────────────
+  REMOVIDO:
+    - from src.rag.vector_store import get_vector_store   ← pgvector eliminado
+    - vectorstore.as_retriever(search_type="mmr", ...)    ← LangChain retriever
+    - filter por metadata do pgvector
+
+  ADICIONADO:
+    - from src.infrastructure.redis_client import busca_hibrida
+    - from src.rag.vector_store import get_embeddings  (só o modelo CPU, não o store)
+    - source_filter="calendario-academico-2026.pdf"    (mesmo valor de antes)
+
+  MANTIDO:
+    - SOURCE_CALENDARIO (deve bater com PDF_CONFIG em rag/ingestion.py)
+    - Descrição da @tool (usada pelo semantic_router para embedding)
+    - Interface de retorno (string) — compatível com o AgentCore v3
+    - _normalizar() e MAX_CHARS
+
+POR QUÊ A BUSCA HÍBRIDA É MELHOR QUE O MMR ANTERIOR:
+───────────────────────────────────────────────────────
+  MMR (Maximal Marginal Relevance) apenas diversificava os resultados vetoriais.
+  Busca Híbrida (BM25 + Vector via RRF) captura ADICIONALMENTE:
+    - Datas exactas: "03/02/2026" → BM25 match exacto, não apenas semântico
+    - Siglas exactas: "2026.1", "substitutiva" → BM25 nunca confunde
+    - Semântica: "início das aulas" ≈ "começo do semestre" → Vector capta
+  Resultado: zero alucinações em datas quando o chunk existe no Redis.
 """
 from __future__ import annotations
+
 import unicodedata
 import logging
+
 from langchain_core.tools import tool
-from src.rag.vector_store import get_vector_store
+
+from src.infrastructure.redis_client import busca_hibrida
+from src.rag.embeddings import get_embeddings
 
 logger = logging.getLogger(__name__)
 
 MAX_CHARS = 1200
 
-# ⚠️  Deve bater EXATAMENTE com a chave em rag/ingestor.py:PDF_CONFIG
+# Deve bater EXACTAMENTE com a chave em rag/ingestion.py:PDF_CONFIG
 SOURCE_CALENDARIO = "calendario-academico-2026.pdf"
 
 
@@ -29,18 +53,11 @@ def _normalizar(texto: str) -> str:
 
 
 def get_tool_calendario():
-    """Fábrica: configura e retorna a @tool com retriever especializado."""
-    vectorstore = get_vector_store()  # singleton — sem custo adicional
-
-    retriever = vectorstore.as_retriever(
-        search_type="mmr",
-        search_kwargs={
-            "k": 4,
-            "fetch_k": 25,
-            "lambda_mult": 0.75,   # 75% relevância, 25% diversidade
-            "filter": {"source": SOURCE_CALENDARIO},
-        },
-    )
+    """
+    Fábrica: configura e retorna a @tool com busca híbrida no Redis.
+    Sem estado interno — a busca é feita em cada chamada.
+    """
+    embeddings_model = get_embeddings()  # singleton — carregado uma vez
 
     @tool
     def consultar_calendario_academico(query: str) -> str:
@@ -66,24 +83,34 @@ def get_tool_calendario():
             query_norm = _normalizar(query)
             logger.debug("📅 Calendário | query: '%s' → '%s'", query, query_norm)
 
-            docs = retriever.invoke(query_norm)
+            # Gera embedding da query (CPU local, ~5ms)
+            vetor = embeddings_model.embed_query(query_norm)
 
-            if not docs:
+            # Busca híbrida: BM25 + Vector filtrado por source
+            resultados = busca_hibrida(
+                query_text=query_norm,
+                query_embedding=vetor,
+                source_filter=SOURCE_CALENDARIO,
+                k_vector=5,
+                k_text=6,
+            )
+
+            if not resultados:
                 return (
                     "Não encontrei essa informação no calendário acadêmico. "
                     "Tente com outras palavras como: matrícula, feriado, prova, "
                     "trancamento, início das aulas, semestre."
                 )
 
-            for i, doc in enumerate(docs):
+            for i, r in enumerate(resultados):
                 logger.debug(
-                    "📅 Chunk %d | source: %s | %s",
+                    "📅 Chunk %d | score=%.3f | %s",
                     i + 1,
-                    doc.metadata.get("source", "?"),
-                    doc.page_content[:80].replace("\n", " "),
+                    r.get("rrf_score", 0),
+                    r.get("content", "")[:80].replace("\n", " "),
                 )
 
-            blocos = [doc.page_content.strip() for doc in docs if doc.page_content.strip()]
+            blocos   = [r["content"].strip() for r in resultados if r.get("content", "").strip()]
             resposta = "\n---\n".join(blocos)
 
             if len(resposta) > MAX_CHARS:

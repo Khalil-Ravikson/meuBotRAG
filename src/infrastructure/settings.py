@@ -1,7 +1,7 @@
 """
 infrastructure/settings.py — Configurações centralizadas
 =========================================================
-Única fonte da verdade para variáveis de ambiente.
+Única fonte da verdade para variáveis de ambiente da Clean Architecture.
 
 Importe em qualquer lugar:
     from src.infrastructure.settings import settings
@@ -18,51 +18,48 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── LLM (Groq) ────────────────────────────────────────────────────────────
+    # ── LLM Principal (Google Gemini - Custo Zero) ────────────────────────────
+    GEMINI_API_KEY:    str   = ""
+    GEMINI_MODEL:      str   = "gemini-2.0-flash" # Modelo super rápido e atualizado
+    GEMINI_TEMP:       float = 0.3
+    GEMINI_MAX_TOKENS: int   = 1024
+
+    # ── LLM Secundário (Groq - Velocidade / Fallback) ─────────────────────────
     GROQ_API_KEY:    str   = ""
     GROQ_MODEL:      str   = "llama-3.1-8b-instant"
-    GROQ_TEMP:       float = 0.3
-    GROQ_MAX_TOKENS: int   = 1024
 
-    # ── HuggingFace ───────────────────────────────────────────────────────────
-    # HF_TOKEN acelera o DOWNLOAD do modelo (evita rate limit do Hub).
-    # Não afeta a velocidade de inferência (isso depende de CPU/GPU).
-    # Obtenha em: https://huggingface.co/settings/tokens
+    # ── HuggingFace (Modelos de Embedding Locais) ─────────────────────────────
     HF_TOKEN: str = ""
 
     # ── RAG / Ingestão ────────────────────────────────────────────────────────
     LLAMA_CLOUD_API_KEY: str = ""
     DATA_DIR:            str = "/app/dados"
 
-    # ── Banco vetorial (pgvector) ─────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/vectordb"
+    # ── Memória e Vector DB Único (Redis - Alta Performance) ──────────────────
+    # O Redis agora faz o papel de Cache, Histórico e Banco de Dados Vetorial (Busca Híbrida)
+    REDIS_URL: str = "redis://redis-cache:6379/0"
 
-    # ── Redis ─────────────────────────────────────────────────────────────────
-    REDIS_URL: str = "redis://localhost:6379/0"
+    # ── WhatsApp (WAHA) ───────────────────────────────────────────────────────
+    WAHA_API_KEY:        str = ""
+    WAHA_DASHBOARD_PASS: str = ""
+    WAHA_BASE_URL:       str = "http://waha:3000"
+    WHATSAPP_HOOK_URL:   str = "http://meu-bot:8000/webhook"
 
-    # ── WAHA (DESCONTINUADO) ───────────────────────────────────────────────────────
-    # WAHA_API_KEY:      str = ""
-    # WAHA_BASE_URL:     str = "http://waha:3000"
-    # WAHA_SESSION:      str = "default"
-    # WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
-
-    # ── EVOLUTION (WhatsApp) ───────────────────────────────────────────────────────
-    EVOLUTION_BASE_URL: str
-    EVOLUTION_API_KEY: str
+    # ── WhatsApp (Evolution API - Alternativa) ────────────────────────────────
+    EVOLUTION_BASE_URL:      str = ""
+    EVOLUTION_API_KEY:       str = ""
     EVOLUTION_INSTANCE_NAME: str = "default"
-    WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
+
     # ── Agente ────────────────────────────────────────────────────────────────
     AGENT_MAX_ITERATIONS: int = 6
     AGENT_TIMEOUT_S:      int = 45
     MAX_HISTORY_MESSAGES: int = 8
 
-    # ── LangSmith (observabilidade LangChain) ─────────────────────────────────
-    # Rastreia chamadas do agente, tokens, tools, latência no dashboard.
-    # Obtenha em: https://smith.langchain.com → Settings → API Keys
-    # Quando vazio, o LangSmith fica desativado automaticamente.
-    LANGCHAIN_API_KEY:    str  = ""
-    LANGCHAIN_PROJECT:    str  = "uema-bot"
-    LANGCHAIN_TRACING_V2: bool = False   # True ativa o rastreamento
+    # ── Observabilidade (Langfuse) ────────────────────────────────────────────
+    # Substitui o LangSmith. Excelente para monitorizar os tokens gastos.
+    LANGFUSE_SECRET_KEY: str = ""
+    LANGFUSE_PUBLIC_KEY: str = ""
+    LANGFUSE_BASE_URL:   str = "https://us.cloud.langfuse.com"
 
     # ── Dev / Debug ───────────────────────────────────────────────────────────
     DEV_MODE:      bool = False
@@ -76,8 +73,9 @@ class Settings(BaseSettings):
         return [n.strip() for n in self.DEV_WHITELIST.split(",") if n.strip()]
 
     @property
-    def langsmith_ativo(self) -> bool:
-        return bool(self.LANGCHAIN_API_KEY and self.LANGCHAIN_TRACING_V2)
+    def langfuse_ativo(self) -> bool:
+        """Verifica se as chaves do Langfuse foram configuradas para ativar o tracing"""
+        return bool(self.LANGFUSE_SECRET_KEY and self.LANGFUSE_PUBLIC_KEY)
 
 
 @lru_cache(maxsize=1)
