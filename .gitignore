@@ -10,6 +10,9 @@ pg-data/
 pg-data-v2/
 pg-data-v3/
 pg-data*/
+redis-data/
+
+
 # Python e Ambiente Virtual
 venv/
 __pycache__/
