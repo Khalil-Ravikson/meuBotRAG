@@ -1,29 +1,18 @@
 """
-main.py — Bootstrap FastAPI (v3 — Clean Architecture)
-======================================================
+main.py — Bootstrap FastAPI (v4 — Arquitetura Assíncrona com Filas)
+===================================================================
 
-O QUE MUDOU vs v2:
-───────────────────
+O QUE MUDOU vs v3 (V4 Update):
+──────────────────────────────
   REMOVIDO:
-    - Referências ao Groq (settings.GROQ_MODEL)
-    - Referências ao AgentState e agent_core._agent_with_history
-    - Import de redis_ok() que agora vem do redis_client novo
-    - DATABASE_URL / pgvector (eliminado da stack)
+    - O processamento síncrono no endpoint /webhook.
+    - A chamada direta para `handle_webhook` que aguardava o RAG/Gemini.
 
   ADICIONADO:
-    - inicializar_indices() do novo redis_client (cria índices híbridos)
-    - GEMINI_MODEL no log de startup
-    - /health verifica agent_core._inicializado (atributo do novo core)
-    - /fatos/:user_id endpoint para debug de long-term memory
-    - /memoria/:session_id endpoint para debug de working memory
-
-  MANTIDO INTACTO:
-    - EvolutionService (WhatsApp — não muda)
-    - DevGuard (middleware de validação — não muda)
-    - handle_webhook (entrada do webhook — não muda)
-    - Ingestor (ingestão de PDFs — não muda)
-    - get_tools_ativas() (definição de tools — não muda)
-    - /logs, /metrics, /banco/sources
+    - Importação de `processar_mensagem_task` do Celery.
+    - O endpoint /webhook agora despacha a tarefa em background (.delay()) 
+      e responde instantaneamente HTTP 200 OK à Evolution API.
+    - Fim dos erros ECONNREFUSED e Timeouts!
 """
 from __future__ import annotations
 import asyncio
@@ -42,9 +31,11 @@ from src.infrastructure.observability import obs
 from src.agent.core import agent_core
 from src.middleware.dev_guard import DevGuard
 from src.services.evolution_service import EvolutionService
-from src.application.handle_webhook import handle_webhook
 from src.rag.ingestion import Ingestor
 from src.tools import get_tools_ativas
+
+# Importe a task do Celery (V4)
+from src.application.tasks import processar_mensagem_task
 
 # =============================================================================
 # Logging
@@ -57,23 +48,19 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-# Silencia loggers muito verbosos
 for _nome in [
     "httpcore.http11", "httpcore.connection", "httpx",
     "urllib3.connectionpool",
-    "google.auth",                  # SDK Gemini
-    "google.generativeai",          # SDK Gemini
-    "sentence_transformers",        # BAAI/bge-m3
-    "transformers",                 # HuggingFace
+    "google.auth",                  
+    "google.generativeai",          
+    "sentence_transformers",        
+    "transformers",                 
 ]:
     logging.getLogger(_nome).setLevel(logging.WARNING)
 
-
 class _WebhookFilter(logging.Filter):
-    """Suprime logs de acesso ao /webhook no uvicorn (muito verboso)."""
     def filter(self, record: logging.LogRecord) -> bool:
         return "/webhook" not in record.getMessage()
-
 
 logging.getLogger("uvicorn.access").addFilter(_WebhookFilter())
 logger = logging.getLogger(__name__)
@@ -82,9 +69,9 @@ logger = logging.getLogger(__name__)
 # App e singletons
 # =============================================================================
 
-app         = FastAPI(title="Bot UEMA", version="3.0")
+app         = FastAPI(title="Bot UEMA", version="4.0")
 api_service = EvolutionService()
-guard       = DevGuard(get_redis_text())  # DevGuard usa cliente texto (sem bytes)
+guard       = DevGuard(get_redis_text())
 
 # =============================================================================
 # Startup
@@ -93,34 +80,23 @@ guard       = DevGuard(get_redis_text())  # DevGuard usa cliente texto (sem byte
 @app.on_event("startup")
 async def startup():
     logger.info(
-        "🚀 Iniciando Bot UEMA v3 | DEV=%s | modelo=%s",
+        "🚀 Iniciando Bot UEMA v4 (Assíncrono) | DEV=%s | modelo=%s",
         settings.DEV_MODE,
-        settings.GEMINI_MODEL,  # Gemini em vez de Groq
+        settings.GEMINI_MODEL,  
     )
 
-    # ── 1. Inicializa índices Redis Stack ─────────────────────────────────────
-    # Cria idx:rag:chunks (BM25 + Vector) e idx:tools (routing semântico)
-    # Idempotente: se já existem, não faz nada
     await asyncio.to_thread(inicializar_indices)
     logger.info("✅ Índices Redis Stack prontos")
 
-    # ── 2. Ingestão de PDFs ───────────────────────────────────────────────────
-    # Guarda chunks no Redis (substitui o pgvector)
-    # ingerir_se_necessario() verifica se já existem chunks antes de re-ingerir
     ingestor = Ingestor()
     await asyncio.to_thread(ingestor.ingerir_se_necessario)
 
-    # ── 3. Diagnóstico em DEV ─────────────────────────────────────────────────
     if settings.DEV_MODE:
         await asyncio.to_thread(ingestor.diagnosticar)
 
-    # ── 4. Inicializa AgentCore com tools ─────────────────────────────────────
-    # Regista tools no Redis para roteamento semântico (sem LLM)
     tools = get_tools_ativas()
     await asyncio.to_thread(agent_core.inicializar, tools)
 
-    # ── 5. Configura webhook Evolution API (com retry) ────────────────────────
-    # A Evolution API pode demorar a arrancar — tentamos 3× com pausa de 5s
     for tentativa in range(1, 4):
         try:
             await api_service.inicializar()
@@ -133,26 +109,37 @@ async def startup():
                 )
                 await asyncio.sleep(5)
             else:
-                logger.error(
-                    "❌ Evolution API inacessível após 3 tentativas. "
-                    "O bot vai funcionar mas não consegue enviar mensagens. "
-                    "Verifique se o container 'evolution-api' está a correr."
-                )
+                logger.error("❌ Evolution API inacessível após 3 tentativas.")
 
     obs.info("SYSTEM", "Startup", f"DEV={settings.DEV_MODE} | tools={len(tools)} | modelo={settings.GEMINI_MODEL}")
-    logger.info("✅ Bot UEMA v3 pronto!")
-
+    logger.info("✅ Bot UEMA v4 pronto para receber webhooks!")
 
 # =============================================================================
-# Routes — Webhook principal
+# Routes — Webhook principal (V4 - Filas)
 # =============================================================================
 
 @app.post("/webhook")
 async def webhook(request: Request):
-    payload   = await request.json()
-    resultado = await handle_webhook(payload, guard, api_service)
-    return JSONResponse(content=resultado)
+    """
+    Rececionista V4: Apenas valida e atira para a fila. 
+    Não espera pelo Gemini nem pelo RAG.
+    """
+    payload = await request.json()
+    
+    # 1. Validação super rápida (spam, dedup)
+    is_valid, identity_or_reason = await guard.validar(payload)
+    
+    if is_valid:
+        identity = identity_or_reason
+        
+        # 2. Despacha a tarefa para o Celery em background (.delay)
+        processar_mensagem_task.delay(identity)
+        logger.debug("📥 Tarefa enviada para a fila do Celery: %s", identity.get("chat_id"))
+    else:
+        logger.debug("🛑 DevGuard bloqueou: %s", identity_or_reason)
 
+    # 3. Responde imediatamente à Evolution API
+    return JSONResponse(content={"status": "ok", "message": "Recebido"}, status_code=200)
 
 # =============================================================================
 # Routes — Health & Observabilidade
@@ -160,65 +147,44 @@ async def webhook(request: Request):
 
 @app.get("/health")
 async def health():
-    """
-    Verifica estado de todos os componentes críticos.
-    Retorna SEMPRE HTTP 200 — o Docker healthcheck lê o status code, não o JSON.
-    O campo 'status' indica a saúde interna sem causar restart do container.
-    """
     redis_status = redis_ok()
     agente_ok    = agent_core._inicializado
 
-    # IMPORTANTE: JSONResponse com status_code=200 sempre
-    # Se retornássemos 503, o Docker marcava unhealthy e reiniciava em loop
     return {
         "status":   "ok" if (redis_status and agente_ok) else "starting",
-        "version":  "3.0",
+        "version":  "4.0",
         "redis":    redis_status,
         "agente":   agente_ok,
         "modelo":   settings.GEMINI_MODEL,
         "dev_mode": settings.DEV_MODE,
     }
 
-
 @app.get("/logs")
 async def get_logs(limit: int = 20):
     return {"errors": obs.get_recent_errors(limit)}
-
 
 @app.get("/metrics")
 async def get_metrics(limit: int = 50):
     return {"metrics": obs.get_recent_metrics(limit)}
 
-
 @app.get("/banco/sources")
 async def banco_sources():
-    """Sources presentes no Redis (substitui o endpoint de pgvector)."""
     ingestor = Ingestor()
     sources  = await asyncio.to_thread(ingestor.diagnosticar)
     return {"sources": list(sources)}
 
-
 # =============================================================================
-# Routes — Debug de Memória (úteis no Chainlit e em testes)
+# Routes — Debug de Memória
 # =============================================================================
 
 @app.get("/fatos/{user_id}")
 async def get_fatos(user_id: str):
-    """
-    Lista todos os fatos long-term de um utilizador.
-    Útil para confirmar que a extração de fatos está a funcionar.
-    """
     from src.memory.long_term_memory import listar_todos_fatos
     fatos = await asyncio.to_thread(listar_todos_fatos, user_id)
     return {"user_id": user_id, "total": len(fatos), "fatos": fatos}
 
-
 @app.get("/memoria/{session_id}")
 async def get_memoria(session_id: str):
-    """
-    Mostra o estado actual da working memory de uma sessão.
-    Inclui histórico compactado e sinais de sessão.
-    """
     from src.memory.working_memory import get_historico_compactado, get_sinais
     historico = await asyncio.to_thread(get_historico_compactado, session_id)
     sinais    = await asyncio.to_thread(get_sinais, session_id)
@@ -230,10 +196,8 @@ async def get_memoria(session_id: str):
         "historico_txt": historico.texto_formatado[:500] + "…" if historico.texto_formatado else "",
     }
 
-
 @app.delete("/memoria/{session_id}")
 async def limpar_memoria(session_id: str):
-    """Limpa a working memory de uma sessão (para testes e suporte)."""
     from src.memory.working_memory import limpar_sessao
     await asyncio.to_thread(limpar_sessao, session_id)
     return {"status": "ok", "session_id": session_id}

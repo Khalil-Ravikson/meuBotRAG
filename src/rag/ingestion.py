@@ -670,7 +670,7 @@ def _gerar_chunk_id(source: str, index: int) -> str:
 def _sources_no_redis() -> set[str]:
     """Sources únicos no Redis — usa FT.AGGREGATE (rápido) com fallback SCAN."""
     from src.infrastructure.redis_client import IDX_CHUNKS
-    from redis.commands.search.aggregations import AggregateRequest
+    from redis.commands.search.aggregation import AggregateRequest
     from redis.commands.search.reducers import count as ft_count
 
     r = get_redis()

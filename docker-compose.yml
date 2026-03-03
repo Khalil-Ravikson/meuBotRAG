@@ -1,41 +1,7 @@
 version: '3.8'
 
 # =============================================================================
-# docker-compose.yml — Bot UEMA v3.3
-# =============================================================================
-#
-# CORRECÇÕES v3.3:
-# ─────────────────
-#   1. CORRECÇÃO PRINCIPAL: container_name do bot mudou de 'bot-rag' para 'bot'
-#      A Evolution API resolve o webhook por container_name na rede Docker.
-#      Com container_name=bot-rag, 'http://bot:9000/webhook' dava ECONNREFUSED
-#      porque 'bot' não resolvia para 'bot-rag'.
-#      Agora container_name=bot → 'http://bot:9000/webhook' funciona.
-#
-#   2. Porta do CMD do uvicorn alinhada com a porta exposta (9000).
-#      O CMD no Dockerfile deve ser: uvicorn src.main:app --host 0.0.0.0 --port 9000
-#
-#   3. Healthcheck simplificado — curl básico sem grep (mais fiável).
-#
-#   4. Evolution API: WEBHOOK_EVENTS filtrados — só MESSAGES_UPSERT e
-#      CONNECTION_UPDATE para não inundar o bot com eventos desnecessários.
-#
-#   5. Evolution Manager removido — imagem quebrada (fs-extra ausente).
-#      Usa o manager nativo: http://localhost:8080/manager
-#
-# ---------------------------------------------------------------------------
-# PORTAS EXPOSTAS:
-#   6379  -> Redis Stack
-#   8001  -> RedisInsight  (http://localhost:8001)
-#   8080  -> Evolution API + Manager nativo (http://localhost:8080/manager)
-#   9000  -> Bot FastAPI   (http://localhost:9000/health)
-#   PostgreSQL NAO exposto (so interno Docker)
-#
-# NOMES DE SERVICO vs CONTAINER_NAME:
-#   servico: bot  →  container_name: bot  →  DNS interno Docker: bot
-#   servico: redis → container_name: redis-stack → DNS: redis (nome do servico)
-#   A Evolution resolve 'http://bot:9000' usando o nome do servico Docker.
-#
+# docker-compose.yml — Bot UEMA v4.0 (Assíncrono com Celery)
 # =============================================================================
 
 networks:
@@ -57,8 +23,12 @@ services:
     ports:
       - "6379:6379"
       - "8001:8001"
+    environment:
+      - TZ=America/Sao_Paulo
     volumes:
       - redis-data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     command: >
       redis-stack-server
       --maxmemory 2gb
@@ -85,8 +55,11 @@ services:
       - POSTGRES_DB=evolution
       - POSTGRES_USER=evolution
       - POSTGRES_PASSWORD=${EVOLUTION_DB_PASS:-evo_pass_2024}
+      - TZ=America/Sao_Paulo
     volumes:
       - evolution-pg-data:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U evolution -d evolution"]
       interval: 10s
@@ -101,7 +74,7 @@ services:
     build:
       context: https://github.com/EvolutionAPI/evolution-api.git#2.3.7
       dockerfile: ./Dockerfile
-    image: evolution-api-local:2.3.7  # Build local da tag 2.3.7 (fix @lid)
+    image: evolution-api-local:2.3.7  
     container_name: evolution-api
     restart: unless-stopped
     networks:
@@ -111,8 +84,9 @@ services:
     environment:
       - SERVER_URL=http://localhost:8080
       - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
+      - TZ=America/Sao_Paulo
 
-      # PostgreSQL (obrigatorio na v2 — SQLite removido)
+      # PostgreSQL
       - DATABASE_ENABLED=true
       - DATABASE_PROVIDER=postgresql
       - DATABASE_CONNECTION_URI=postgresql://evolution:${EVOLUTION_DB_PASS:-evo_pass_2024}@evolution-postgres:5432/evolution
@@ -129,27 +103,17 @@ services:
       - CACHE_REDIS_PREFIX_KEY=evolution
       - CACHE_REDIS_SAVE_INSTANCES=false
 
-      # Webhook — aponta para o bot pelo nome do servico Docker
-      # IMPORTANTE: usar nome do servico 'bot', nao container_name
+      # Webhook
       - WEBHOOK_GLOBAL_URL=http://bot:9000/webhook
       - WEBHOOK_GLOBAL_ENABLED=true
-      # Filtrar apenas eventos necessarios — reduz trafego desnecessario
       - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
-      - WEBHOOK_EVENTS_MESSAGES_UPDATE=false
-      - WEBHOOK_EVENTS_MESSAGES_DELETE=false
-      - WEBHOOK_EVENTS_SEND_MESSAGE=false
-      - WEBHOOK_EVENTS_CONTACTS_UPDATE=false
-      - WEBHOOK_EVENTS_CONTACTS_UPSERT=false
-      - WEBHOOK_EVENTS_PRESENCE_UPDATE=false
-      - WEBHOOK_EVENTS_CHATS_UPDATE=false
-      - WEBHOOK_EVENTS_CHATS_UPSERT=false
       - WEBHOOK_EVENTS_CONNECTION_UPDATE=true
-      - WEBHOOK_EVENTS_GROUPS_UPSERT=false
-      - WEBHOOK_EVENTS_GROUPS_UPDATE=false
       - CONFIG_SESSION_PHONE_VERSION=2.3000.1032691661
 
     volumes:
       - ./evolution_instances:/evolution/instances
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     depends_on:
       redis:
         condition: service_healthy
@@ -163,10 +127,7 @@ services:
       start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # 4. Bot RAG
-  #
-  # CRITICO: container_name=bot para que 'http://bot:9000' resolva correctamente
-  # O nome do servico Docker ('bot') e o container_name devem ser IGUAIS.
+  # 4. Bot RAG (Rececionista Webhook)
   # ---------------------------------------------------------------------------
   bot:
     build: .
@@ -184,18 +145,46 @@ services:
     volumes:
       - ./dados:/app/dados
       - ./src:/app/src
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     env_file:
       - .env
     environment:
       - REDIS_URL=redis://redis:6379/0
       - EVOLUTION_BASE_URL=http://evolution-api:8080
       - WHATSAPP_HOOK_URL=http://bot:9000/webhook
+      - TZ=America/Sao_Paulo
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:9000/health || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 5
       start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # 5. Celery Worker (Processamento Pesado em Background V4)
+  # ---------------------------------------------------------------------------
+  celery-worker:
+    build: .
+    container_name: celery-worker
+    restart: unless-stopped
+    networks:
+      - uema
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./dados:/app/dados
+      - ./src:/app/src
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - EVOLUTION_BASE_URL=http://evolution-api:8080
+      - TZ=America/Sao_Paulo
+    command: celery -A src.infrastructure.celery_app.celery_app worker --loglevel=info --concurrency=2
 
 volumes:
   redis-data:
