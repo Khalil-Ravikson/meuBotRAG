@@ -162,19 +162,21 @@ async def webhook(request: Request):
 async def health():
     """
     Verifica estado de todos os componentes críticos.
-    Usado pelo healthcheck do Docker e pelo Chainlit.
+    Retorna SEMPRE HTTP 200 — o Docker healthcheck lê o status code, não o JSON.
+    O campo 'status' indica a saúde interna sem causar restart do container.
     """
     redis_status = redis_ok()
-    agente_ok    = agent_core._inicializado  # atributo do novo AgentCore
+    agente_ok    = agent_core._inicializado
 
+    # IMPORTANTE: JSONResponse com status_code=200 sempre
+    # Se retornássemos 503, o Docker marcava unhealthy e reiniciava em loop
     return {
-        "status":      "ok" if (redis_status and agente_ok) else "degraded",
-        "version":     "3.0",
-        "redis":       redis_status,
-        "agente":      agente_ok,
-        "modelo":      settings.GEMINI_MODEL,
-        "dev_mode":    settings.DEV_MODE,
-        "pgvector":    False,   # Eliminado na v3 — documentado explicitamente
+        "status":   "ok" if (redis_status and agente_ok) else "starting",
+        "version":  "3.0",
+        "redis":    redis_status,
+        "agente":   agente_ok,
+        "modelo":   settings.GEMINI_MODEL,
+        "dev_mode": settings.DEV_MODE,
     }
 
 

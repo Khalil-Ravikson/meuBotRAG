@@ -1,75 +1,44 @@
 """
-rag/ingestion.py — Ingestor v3 (Redis Stack + Chunking Hierárquico)
-=====================================================================
+rag/ingestion.py — Ingestor v3.1 (dual-parser: pymupdf ou LlamaParse)
+=======================================================================
 
-SUBSTITUI: src/rag/ingestor.py
+DOIS PARSERS DISPONÍVEIS — escolhe no .env:
+─────────────────────────────────────────────
+  PDF_PARSER=pymupdf      ← local, gratuito, rápido (~50ms/página)
+                             bom para PDFs simples e semi-estruturados
+  PDF_PARSER=llamaparse   ← cloud, pago por página (~$0.003/pág)
+                             melhor para tabelas complexas e layouts difíceis
 
-O QUE MUDOU vs ingestor.py:
-─────────────────────────────
-  REMOVIDO:
-    - pgvector / PGVector / langchain_postgres → tudo vai para o Redis
-    - LlamaParse (API externa, paga por página) → substituído por pymupdf (local, gratuito)
-    - langchain_text_splitters.RecursiveCharacterTextSplitter → chunker próprio
+  O default é pymupdf. Para activar o LlamaParse:
+    1. Adiciona ao .env:
+         PDF_PARSER=llamaparse
+         LLAMA_CLOUD_API_KEY=llx-...
+    2. Adiciona ao requirements.txt:
+         llama-parse
+    3. Faz docker-compose restart bot
 
-  ADICIONADO:
-    - Chunking Hierárquico: chunks têm metadados estruturados inline
-    - Prefixo de fonte no início de cada chunk (âncora anti-alucinação)
-    - Embeddings computados localmente com BAAI/bge-m3 (CPU — sem CUDA)
-    - Persistência no Redis via redis_client.salvar_chunk()
-    - Verificação de re-ingestão por count de chunks no Redis (não por query)
+COMO FUNCIONA A SELECÇÃO:
+─────────────────────────
+  No startup, _parsear_pdf() lê settings.PDF_PARSER e despacha para
+  _parsear_com_pymupdf() ou _parsear_com_llamaparse().
+  Os TXTs são sempre lidos directamente (sem parser externo).
 
-  MANTIDO:
-    - PDF_CONFIG com as mesmas chaves (compatível com as tools existentes)
-    - diagnosticar() — retorna sources presentes no Redis
-    - ingerir_se_necessario() e ingerir_tudo() — interface pública igual
+  Podes também configurar por ficheiro individual no PDF_CONFIG,
+  adicionando a chave "parser": "llamaparse" só nos PDFs complexos.
+  Se "parser" não estiver definido no config, usa o default do settings.
 
-COMO O CHUNKING HIERÁRQUICO FUNCIONA:
-────────────────────────────────────────
-  O chunking "flat" do sistema anterior produzia chunks sem contexto:
-    ❌ "03/02/2026 a 07/02/2026"   ← data sem contexto = alucinação garantida
-
-  O chunking hierárquico prefazia cada chunk com a sua fonte:
-    ✓ "[CALENDÁRIO ACADÊMICO UEMA 2026 | evento_academico]\n
-       EVENTO: Matrícula de veteranos | DATA: 03/02/2026 a 07/02/2026 | SEM: 2026.1"
-
-  Resultado: o LLM vê a fonte antes do conteúdo → resposta ancorada.
-
-  O PREFIXO NÃO CONTA para o chunk_size — é adicionado depois do split,
-  por isso o texto útil por chunk mantém-se dentro do limite configurado.
-
-ESTRUTURA NO REDIS (após ingestão):
-─────────────────────────────────────
-  rag:chunk:calendario-academico-2026.pdf:0000
-  rag:chunk:calendario-academico-2026.pdf:0001
-  ...
-  rag:chunk:edital_paes_2026.pdf:0000
-  ...
-
-  Cada JSON:
-  {
-    "content":     "[CALENDÁRIO ACADÊMICO UEMA 2026 | ...]\nEVENTO: ...",
-    "source":      "calendario-academico-2026.pdf",
-    "doc_type":    "calendario",
-    "chunk_index": 0,
-    "embedding":   [0.023, -0.041, ...],   ← 1024 floats (BAAI/bge-m3)
-    "metadata": {
-      "titulo_fonte": "Calendário Acadêmico UEMA 2026",
-      "pagina":       1
-    }
-  }
-
-PARSE DE PDFs SEM LLAMAPARSE:
-───────────────────────────────
-  Usamos pymupdf (fitz) — instala com: pip install pymupdf
-  É local, gratuito, rápido (~50ms por página) e sem limite de páginas.
-  Para os PDFs da UEMA (tabelas de calendário e edital), o output do pymupdf
-  é suficiente. Para PDFs com layouts muito complexos, considera manter
-  LlamaParse apenas para esses ficheiros específicos.
+O RESTO NÃO MUDOU:
+──────────────────
+  - Chunking Hierárquico com prefixo anti-alucinação
+  - Verificação por ficheiro (só ingere os novos)
+  - Embeddings BAAI/bge-m3 locais (CPU)
+  - Persistência no Redis Stack
 """
 from __future__ import annotations
 
 import glob
 import hashlib
+import json
 import logging
 import os
 import re
@@ -86,49 +55,114 @@ from src.infrastructure.settings import settings
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuração por ficheiro (mesmas chaves do ingestor.py original)
-# SOURCE_* nas tools deve bater EXACTAMENTE com estas chaves
+# Configuração por ficheiro
+# A chave "parser" é opcional — substitui o PDF_PARSER do settings por ficheiro
 # ─────────────────────────────────────────────────────────────────────────────
 
 PDF_CONFIG: dict[str, dict] = {
     # ── PDFs ──────────────────────────────────────────────────────────────────
     "calendario-academico-2026.pdf": {
-        "doc_type":    "calendario",
-        "titulo":      "Calendário Acadêmico UEMA 2026",
-        "chunk_size":  350,
-        "overlap":     60,
-        "label":       "CALENDÁRIO ACADÊMICO UEMA 2026",
+        "doc_type":   "calendario",
+        "titulo":     "Calendário Acadêmico UEMA 2026",
+        "chunk_size": 350,
+        "overlap":    60,
+        "label":      "CALENDÁRIO ACADÊMICO UEMA 2026",
+        # "parser": "llamaparse",  # descomenta para forçar LlamaParse neste ficheiro
     },
     "edital_paes_2026.pdf": {
-        "doc_type":    "edital",
-        "titulo":      "Edital PAES 2026 — Processo Seletivo UEMA",
-        "chunk_size":  550,
-        "overlap":     80,
-        "label":       "EDITAL PAES 2026",
+        "doc_type":   "edital",
+        "titulo":     "Edital PAES 2026 — Processo Seletivo UEMA",
+        "chunk_size": 550,
+        "overlap":    80,
+        "label":      "EDITAL PAES 2026",
+        # "parser": "llamaparse",  # descomenta se as tabelas de vagas ficarem mal
     },
     "guia_contatos_2025.pdf": {
-        "doc_type":    "contatos",
-        "titulo":      "Guia de Contatos UEMA 2025",
-        "chunk_size":  280,
-        "overlap":     30,
-        "label":       "CONTATOS UEMA 2025",
+        "doc_type":   "contatos",
+        "titulo":     "Guia de Contatos UEMA 2025",
+        "chunk_size": 280,
+        "overlap":    30,
+        "label":      "CONTATOS UEMA 2025",
     },
-    # ── TXTs ──────────────────────────────────────────────────────────────────
+    # ── TXTs (sempre lidos directamente — parser ignorado) ────────────────────
     "contatos_saoluis.txt": {
-        "doc_type":    "contatos",
-        "titulo":      "Contatos São Luís — UEMA",
-        "chunk_size":  280,
-        "overlap":     30,
-        "label":       "CONTATOS SÃO LUÍS",
+        "doc_type":   "contatos",
+        "titulo":     "Contatos São Luís — UEMA",
+        "chunk_size": 280,
+        "overlap":    30,
+        "label":      "CONTATOS SÃO LUÍS",
     },
     "regras_ru.txt": {
-        "doc_type":    "geral",
-        "titulo":      "Regras do Restaurante Universitário",
-        "chunk_size":  350,
-        "overlap":     50,
-        "label":       "RESTAURANTE UNIVERSITÁRIO",
+        "doc_type":   "geral",
+        "titulo":     "Regras do Restaurante Universitário",
+        "chunk_size": 350,
+        "overlap":    50,
+        "label":      "RESTAURANTE UNIVERSITÁRIO",
     },
 }
+
+# Valores válidos para PDF_PARSER
+_PARSERS_VALIDOS = {"pymupdf", "llamaparse"}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Manifesto de ingestão (ficheiro em disco — independente do Redis)
+#
+# Problema que resolve:
+#   _sources_no_redis() depende do Redis ter o índice FT criado.
+#   No startup, o Redis pode estar a iniciar e o índice ainda não existe.
+#   Resultado: devolve set() vazio → re-ingere tudo desnecessariamente.
+#
+# Solução:
+#   Guardamos um ficheiro JSON em DATA_DIR/.ingest_manifest.json com:
+#     { "calendario-academico-2026.pdf": { "hash": "abc123", "chunks": 45 }, ... }
+#   O hash é do conteúdo do ficheiro — se o PDF mudar, o hash muda e re-ingere.
+#   Se o Redis perder dados mas o ficheiro existir, o manifesto protege.
+#
+# Ciclo de vida:
+#   1. Startup → lê manifesto → compara com ficheiros em disco
+#   2. Se hash igual → skip (mesmo que Redis esteja vazio temporariamente)
+#   3. Após ingestão bem-sucedida → actualiza manifesto
+#   4. Para forçar re-ingestão: apaga DATA_DIR/.ingest_manifest.json
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _caminho_manifesto() -> str:
+    return os.path.join(settings.DATA_DIR, ".ingest_manifest.json")
+
+
+def _ler_manifesto() -> dict:
+    """Lê o manifesto de disco. Devolve {} se não existir ou estiver corrompido."""
+    path = _caminho_manifesto()
+    try:
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+    except Exception as e:
+        logger.warning("⚠️  Manifesto corrompido, ignorado: %s", e)
+    return {}
+
+
+def _guardar_manifesto(manifesto: dict) -> None:
+    """Guarda o manifesto em disco atomicamente."""
+    path = _caminho_manifesto()
+    tmp  = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(manifesto, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)  # atómico — nunca fica ficheiro meio-escrito
+        logger.debug("💾 Manifesto actualizado: %s", path)
+    except Exception as e:
+        logger.warning("⚠️  Falha ao guardar manifesto: %s", e)
+
+
+def _hash_ficheiro(caminho: str) -> str:
+    """SHA-256 dos primeiros 64KB do ficheiro (rápido, detecta mudanças)."""
+    h = hashlib.sha256()
+    try:
+        with open(caminho, "rb") as f:
+            h.update(f.read(65536))
+    except Exception:
+        pass
+    return h.hexdigest()[:16]  # 16 chars são suficientes para detectar mudanças
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,12 +172,12 @@ PDF_CONFIG: dict[str, dict] = {
 @dataclass
 class ChunkBruto:
     """Chunk de texto antes de gerar o embedding."""
-    texto_puro:    str          # Texto sem prefixo (para o splitter)
-    texto_final:   str          # Texto com prefixo hierárquico (vai para o Redis)
-    source:        str
-    doc_type:      str
-    chunk_index:   int
-    metadata:      dict = field(default_factory=dict)
+    texto_puro:  str
+    texto_final: str
+    source:      str
+    doc_type:    str
+    chunk_index: int
+    metadata:    dict = field(default_factory=dict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,90 +186,151 @@ class ChunkBruto:
 
 class Ingestor:
     """
-    Substitui o Ingestor do ingestor.py original.
-    Interface pública idêntica para compatibilidade com main.py.
+    Ingestor com suporte a dois parsers de PDF.
+    Interface pública idêntica ao ingestor.py original.
     """
 
     def __init__(self):
-        # Importa o modelo de embedding aqui (singleton via lru_cache)
-        # Evita re-carregar o BAAI/bge-m3 em cada instância
         from src.rag.embeddings import get_embeddings
         self._embeddings = get_embeddings()
 
-    # ── API pública (igual ao ingestor.py original) ───────────────────────────
+        # Valida e loga o parser activo no startup
+        parser = settings.PDF_PARSER.lower()
+        if parser not in _PARSERS_VALIDOS:
+            logger.warning(
+                "⚠️  PDF_PARSER='%s' inválido. A usar 'pymupdf'. "
+                "Valores válidos: %s",
+                parser, _PARSERS_VALIDOS,
+            )
+        elif parser == "llamaparse":
+            if not settings.LLAMA_CLOUD_API_KEY:
+                logger.error(
+                    "❌ PDF_PARSER=llamaparse mas LLAMA_CLOUD_API_KEY não está definida no .env! "
+                    "A fazer fallback para pymupdf."
+                )
+            else:
+                logger.info("🦙 Parser activo: LlamaParse (cloud — pago por página)")
+        else:
+            logger.info("📄 Parser activo: pymupdf (local — gratuito)")
+
+    # ── API pública ───────────────────────────────────────────────────────────
 
     def ingerir_se_necessario(self) -> None:
         """
-        Verifica ficheiro a ficheiro quais já estão no Redis.
-        Só processa os que ainda não existem — os já ingeridos são ignorados.
+        Verifica ficheiro a ficheiro quais precisam de ser ingeridos.
 
-        LÓGICA:
-          Para cada ficheiro no PDF_CONFIG, verifica se existe pelo menos
-          1 chunk com esse source no Redis. Se não existe → ingere.
-          Se existe → pula (já está feito).
+        FONTE DE VERDADE: manifesto em disco (DATA_DIR/.ingest_manifest.json)
+        ─────────────────────────────────────────────────────────────────────
+        Usa o hash do conteúdo do ficheiro para decidir se deve re-ingerir:
+          - Hash igual ao manifesto → skip (mesmo que Redis esteja a reiniciar)
+          - Hash diferente           → ficheiro mudou → re-ingere
+          - Não está no manifesto    → ficheiro novo → ingere
 
-        VANTAGEM vs verificação binária anterior:
-          Anterior: "tem algum chunk?" → se sim, ignora TUDO (incluindo novos ficheiros)
-          Actual:   verifica cada ficheiro individualmente → só processa os novos
+        Vantagem sobre verificar só o Redis:
+          O Redis pode estar a iniciar no startup e o índice FT ainda não existe.
+          O manifesto em disco está sempre disponível imediatamente.
 
-        EXEMPLO:
-          Redis tem: calendario, edital
-          Pasta tem: calendario, edital, guia_contatos (novo)
-          Resultado: só guia_contatos é processado → economia de tokens de embedding
+        Para forçar re-ingestão:
+          - De um ficheiro: apaga a entrada no .ingest_manifest.json
+          - De tudo:        rm dados/.ingest_manifest.json
         """
-        data_dir   = settings.DATA_DIR
-        ficheiros  = self._listar_ficheiros(data_dir)
+        data_dir  = settings.DATA_DIR
+        ficheiros = self._listar_ficheiros(data_dir)
 
         if not ficheiros:
             logger.warning("⚠️  Nenhum ficheiro em %s", data_dir)
             return
 
-        sources_existentes = _sources_no_redis()
-        pendentes = []
+        manifesto  = _ler_manifesto()
+        pendentes  = []   # (caminho, motivo)
+        ignorados  = []
 
         for caminho in ficheiros:
             nome = os.path.basename(caminho)
             if nome not in PDF_CONFIG:
-                # Não está na config → ignora silenciosamente
                 continue
-            if nome in sources_existentes:
-                logger.info("💾 '%s' já está no Redis. Ignorado.", nome)
+
+            hash_actual = _hash_ficheiro(caminho)
+            entrada     = manifesto.get(nome, {})
+
+            if entrada.get("hash") == hash_actual:
+                ignorados.append(nome)
+                logger.info("💾 '%s' já ingerido (hash ok). Skip.", nome)
             else:
-                pendentes.append(caminho)
+                motivo = "novo" if nome not in manifesto else "modificado"
+                pendentes.append((caminho, motivo))
 
         if not pendentes:
-            logger.info("✅ Todos os ficheiros já estão no Redis. Nada a fazer.")
+            logger.info("✅ Todos os ficheiros já estão no manifesto. Nada a fazer.")
+            # Garante que o Redis também tem os dados (por se houve perda de dados)
+            self._verificar_redis_vs_manifesto(manifesto, ficheiros)
             return
 
         logger.info(
-            "📭 %d ficheiro(s) novo(s) para ingerir: %s",
+            "📭 %d ficheiro(s) para ingerir: %s",
             len(pendentes),
-            [os.path.basename(p) for p in pendentes],
+            [(os.path.basename(p), m) for p, m in pendentes],
         )
 
-        total_chunks = 0
-        for caminho in pendentes:
-            total_chunks += self._ingerir_ficheiro(caminho)
+        for caminho, _ in pendentes:
+            nome   = os.path.basename(caminho)
+            chunks = self._ingerir_ficheiro(caminho)
+            if chunks > 0:
+                manifesto[nome] = {
+                    "hash":   _hash_ficheiro(caminho),
+                    "chunks": chunks,
+                }
+                _guardar_manifesto(manifesto)  # guarda após cada ficheiro
+                logger.info("✅ '%s': %d chunks → manifesto actualizado.", nome, chunks)
 
-        logger.info("✅ Ingestão parcial concluída: %d chunks novos.", total_chunks)
         self.diagnosticar()
 
-    def ingerir_tudo(self) -> None:
-        """Força re-ingestão de todos os ficheiros, mesmo se o Redis não estiver vazio."""
-        data_dir = settings.DATA_DIR
-        logger.info("🕵️  Ingestão em: %s", data_dir)
+    def _verificar_redis_vs_manifesto(self, manifesto: dict, ficheiros: list) -> None:
+        """
+        Verifica se o Redis tem os dados que o manifesto diz existirem.
+        Se o Redis perdeu dados (ex: volume apagado), re-ingere silenciosamente.
+        Chamado apenas quando o manifesto diz que tudo está ok.
+        """
+        try:
+            sources_redis = _sources_no_redis()
+            em_falta      = []
 
+            for caminho in ficheiros:
+                nome = os.path.basename(caminho)
+                if nome in manifesto and nome not in sources_redis:
+                    em_falta.append(caminho)
+
+            if not em_falta:
+                return
+
+            logger.warning(
+                "⚠️  Manifesto diz ok mas Redis perdeu %d ficheiro(s): %s\n"
+                "   (Redis foi reiniciado sem volume persistente?)\n"
+                "   A re-ingerir no Redis sem actualizar manifesto...",
+                len(em_falta),
+                [os.path.basename(p) for p in em_falta],
+            )
+            for caminho in em_falta:
+                self._ingerir_ficheiro(caminho)
+
+        except Exception as e:
+            logger.debug("ℹ️  Verificação Redis vs manifesto falhou (ignorado): %s", e)
+
+    def ingerir_tudo(self) -> None:
+        """Força re-ingestão de todos os ficheiros (ignora o que já existe)."""
+        data_dir  = settings.DATA_DIR
         ficheiros = self._listar_ficheiros(data_dir)
+
         if not ficheiros:
             logger.warning("⚠️  Nenhum ficheiro em %s", data_dir)
             return
 
+        logger.info("🕵️  Ingestão em: %s", data_dir)
         logger.info("📁 Ficheiros: %s", [os.path.basename(f) for f in ficheiros])
 
         total_chunks = 0
         for ficheiro in ficheiros:
-            n = self._ingerir_ficheiro(ficheiro)
-            total_chunks += n
+            total_chunks += self._ingerir_ficheiro(ficheiro)
 
         logger.info("✅ Ingestão concluída: %d chunks guardados no Redis.", total_chunks)
         self.diagnosticar()
@@ -245,6 +340,7 @@ class Ingestor:
         sources = _sources_no_redis()
         print("=" * 60)
         print("🔍 DIAGNÓSTICO — Redis Stack")
+        print(f"   Parser activo: {settings.PDF_PARSER}")
         print(f"   Sources presentes: {sources}")
         print(f"   Esperados (PDF_CONFIG): {list(PDF_CONFIG.keys())}")
         faltam = set(PDF_CONFIG.keys()) - sources
@@ -270,27 +366,26 @@ class Ingestor:
         eh_txt = nome.lower().endswith(".txt")
 
         try:
-            # 1. Extrai texto
+            # 1. Extrai texto — TXT directo, PDF via parser configurado
             if eh_txt:
                 texto_raw = _ler_txt(caminho)
             else:
-                texto_raw = _parsear_pdf(caminho)
+                texto_raw = _parsear_pdf(caminho, config)
 
             if not texto_raw.strip():
                 logger.warning("⚠️  '%s' está vazio após parsing.", nome)
                 return 0
 
-            # 2. Limpa texto
+            # 2. Limpa
             texto_limpo = _limpar_texto(texto_raw)
 
-            # 3. Cria chunks com metadados hierárquicos
+            # 3. Chunks com metadados hierárquicos
             chunks = list(_criar_chunks(texto_limpo, nome, config))
-
             if not chunks:
                 logger.warning("⚠️  Nenhum chunk gerado para '%s'.", nome)
                 return 0
 
-            # 4. Gera embeddings em batch (mais eficiente que um a um)
+            # 4. Embeddings em batch
             textos_para_embed = [c.texto_puro for c in chunks]
             embeddings = self._embeddings.embed_documents(textos_para_embed)
 
@@ -299,7 +394,7 @@ class Ingestor:
                 chunk_id = _gerar_chunk_id(nome, chunk.chunk_index)
                 salvar_chunk(
                     chunk_id=chunk_id,
-                    content=chunk.texto_final,   # Com prefixo hierárquico
+                    content=chunk.texto_final,
                     source=chunk.source,
                     doc_type=chunk.doc_type,
                     embedding=embedding,
@@ -323,158 +418,130 @@ class Ingestor:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Chunking Hierárquico
+# Parsers de PDF
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _criar_chunks(
-    texto: str,
-    nome_ficheiro: str,
-    config: dict,
-) -> Iterator[ChunkBruto]:
+def _parsear_pdf(caminho: str, config: dict) -> str:
     """
-    Divide o texto em chunks e adiciona prefixo hierárquico a cada um.
+    Despacha para o parser correcto.
 
-    ESTRUTURA DO CHUNK FINAL (o que vai para o Redis e depois para o prompt):
-    ──────────────────────────────────────────────────────────────────────────
-      [CALENDÁRIO ACADÊMICO UEMA 2026 | calendario]
-      EVENTO: Matrícula de veteranos | DATA: 03/02/2026 a 07/02/2026 | SEM: 2026.1
-
-    POR QUÊ O PREFIXO É ANTI-ALUCINAÇÃO:
-      O Gemini vê explicitamente de onde vem a informação ANTES de a ler.
-      Estudos de grounding mostram que o LLM "ancora" a resposta na fonte
-      declarada → menos probabilidade de misturar com conhecimento interno.
-
-    OVERLAP:
-      O overlap entre chunks garante que frases no limite não são cortadas
-      a meio. Para tabelas (edital, calendário), usamos overlap maior.
+    Ordem de prioridade:
+      1. config["parser"] — parser específico para este ficheiro (se definido)
+      2. settings.PDF_PARSER — parser global do .env
+      3. fallback para pymupdf se o LlamaParse falhar ou não tiver API key
     """
-    chunk_size = config["chunk_size"]
-    overlap    = config["overlap"]
-    label      = config["label"]
-    doc_type   = config["doc_type"]
-    prefixo    = f"[{label} | {doc_type}]\n"
+    # Parser por ficheiro tem prioridade sobre o global
+    parser_nome = config.get("parser") or settings.PDF_PARSER.lower()
 
-    # Divide em parágrafos primeiro (preserva estrutura de tabelas)
-    paragrafos = _dividir_em_paragrafos(texto)
+    if parser_nome == "llamaparse":
+        if not settings.LLAMA_CLOUD_API_KEY:
+            logger.warning(
+                "⚠️  LlamaParse pedido mas LLAMA_CLOUD_API_KEY ausente. "
+                "A usar pymupdf como fallback."
+            )
+            return _parsear_com_pymupdf(caminho)
+        return _parsear_com_llamaparse(caminho, config)
 
-    buffer       = ""
-    chunk_index  = 0
-
-    for paragrafo in paragrafos:
-        paragrafo = paragrafo.strip()
-        if not paragrafo:
-            continue
-
-        # Se o parágrafo sozinho excede chunk_size, divide-o
-        if len(paragrafo) > chunk_size * 1.5:
-            # Primeiro emite o buffer acumulado
-            if buffer.strip():
-                yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
-                chunk_index += 1
-                buffer = buffer[-overlap:] if overlap else ""
-
-            # Divide o parágrafo longo em sentenças
-            for parte in _dividir_em_sentencas(paragrafo, chunk_size, overlap):
-                yield _fazer_chunk(parte, prefixo, nome_ficheiro, doc_type, chunk_index)
-                chunk_index += 1
-            continue
-
-        # Verifica se o buffer + parágrafo excedem chunk_size
-        candidato = buffer + ("\n" if buffer else "") + paragrafo
-        if len(candidato) <= chunk_size:
-            buffer = candidato
-        else:
-            # Emite o buffer actual e começa novo com overlap
-            if buffer.strip():
-                yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
-                chunk_index += 1
-                # Overlap: mantém os últimos N chars do buffer
-                buffer = buffer[-overlap:] + "\n" + paragrafo if overlap else paragrafo
-            else:
-                buffer = paragrafo
-
-    # Emite o buffer final
-    if buffer.strip():
-        yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
+    return _parsear_com_pymupdf(caminho)
 
 
-def _fazer_chunk(
-    texto_puro: str,
-    prefixo: str,
-    source: str,
-    doc_type: str,
-    chunk_index: int,
-) -> ChunkBruto:
-    """Cria um ChunkBruto com o texto final (prefixo + conteúdo)."""
-    return ChunkBruto(
-        texto_puro=texto_puro.strip(),
-        texto_final=prefixo + texto_puro.strip(),
-        source=source,
-        doc_type=doc_type,
-        chunk_index=chunk_index,
-        metadata={"titulo_fonte": prefixo.strip("[]").split("|")[0].strip()},
-    )
-
-
-def _dividir_em_paragrafos(texto: str) -> list[str]:
-    """Divide por linhas em branco duplas ou por newlines simples."""
-    # Tenta divisão por parágrafo real primeiro
-    blocos = re.split(r"\n{2,}", texto)
-    if len(blocos) > 3:
-        return blocos
-    # Fallback: divide por newline simples (PDFs com linha por linha)
-    return texto.split("\n")
-
-
-def _dividir_em_sentencas(texto: str, chunk_size: int, overlap: int) -> list[str]:
-    """Divide texto longo em partes de chunk_size com overlap."""
-    partes = []
-    inicio = 0
-    while inicio < len(texto):
-        fim = inicio + chunk_size
-        if fim >= len(texto):
-            partes.append(texto[inicio:])
-            break
-        # Tenta cortar num espaço para não partir palavras
-        espaco = texto.rfind(" ", inicio, fim)
-        if espaco > inicio:
-            fim = espaco
-        partes.append(texto[inicio:fim].strip())
-        inicio = fim - overlap if overlap else fim
-    return [p for p in partes if p.strip()]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Parsers de ficheiro
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parsear_pdf(caminho: str) -> str:
+def _parsear_com_pymupdf(caminho: str) -> str:
     """
-    Extrai texto de PDF usando pymupdf (fitz).
-    Local, gratuito, sem API externa.
+    Extrai texto com pymupdf (fitz).
 
-    ALTERNATIVA: se o PDF for muito complexo (colunas, tabelas aninhadas),
-    considera usar camelot-py ou tabula-py especificamente para as tabelas
-    de vagas do edital.
+    PRÓS:  local, gratuito, ~50ms/página, sem limite
+    CONTRAS: PDFs baseados em imagem/scan devolvem texto vazio.
+             Nesse caso activa PDF_PARSER=llamaparse no .env.
 
     INSTALA: pip install pymupdf
     """
     try:
-        import fitz  # pymupdf
-        doc = fitz.open(caminho)
-        paginas = []
-        for i, pagina in enumerate(doc):
-            texto = pagina.get_text("text")  # "text" é o mais limpo para tabelas simples
+        import fitz
+        doc       = fitz.open(caminho)
+        paginas   = []
+        nome      = os.path.basename(caminho)
+        n_total   = len(doc)
+
+        for pagina in doc:
+            texto = pagina.get_text("text")
             if texto.strip():
                 paginas.append(texto)
         doc.close()
+        if not paginas:
+            logger.warning( "pymupdf: 0 páginas com texto em '%s' ('%d' págs)."
+
+                            ,"PDF provavelmente baseado em imagem/scan.",
+
+                            "Solução: adiciona PDF_PARSER=llamaparse ao .env e LLAMA_CLOUD_API_KEY=llx-...,"
+
+                            ,nome, n_total,
+
+                                )
+        else:
+            logger.debug("📄 pymupdf: %d/%d páginas | '%s'", len(paginas), n_total, nome)
+
         return "\n\n".join(paginas)
+
     except ImportError:
         logger.error("❌ pymupdf não instalado. Executa: pip install pymupdf")
         raise
     except Exception as e:
-        logger.exception("❌ Falha ao parsear PDF '%s': %s", caminho, e)
+        logger.exception("❌ pymupdf falhou em '%s': %s", caminho, e)
         return ""
+
+
+def _parsear_com_llamaparse(caminho: str, config: dict) -> str:
+    """
+    Extrai texto com LlamaParse (API cloud Llama Index).
+
+    PRÓS:  excelente com tabelas complexas, colunas, layouts difíceis
+    CONTRAS: pago (~$0.003/página), lento (round-trip cloud), precisa de API key
+
+    ACTIVA NO .env:
+      PDF_PARSER=llamaparse
+      LLAMA_CLOUD_API_KEY=llx-...
+
+    INSTALA: pip install llama-parse
+
+    A parsing_instruction é lida do PDF_CONFIG["parsing_instruction"].
+    Se não estiver definida, usa uma instrução genérica.
+    """
+    try:
+        from llama_parse import LlamaParse
+    except ImportError:
+        logger.error(
+            "❌ llama-parse não instalado. Executa: pip install llama-parse\n"
+            "   A fazer fallback para pymupdf."
+        )
+        return _parsear_com_pymupdf(caminho)
+
+    instrucao = config.get("parsing_instruction") or (
+        "Extrai todo o texto preservando a estrutura de tabelas. "
+        "Para tabelas, usa o formato: COLUNA1: valor | COLUNA2: valor. "
+        "Responde em português."
+    )
+
+    try:
+        parser = LlamaParse(
+            api_key=settings.LLAMA_CLOUD_API_KEY,
+            result_type="markdown",
+            language="pt",
+            verbose=False,
+            parsing_instruction=instrucao,
+        )
+        docs    = parser.load_data(caminho)
+        paginas = [doc.text for doc in docs if doc.text.strip()]
+        logger.debug(
+            "🦙 LlamaParse: %d páginas extraídas de '%s'",
+            len(paginas), os.path.basename(caminho),
+        )
+        return "\n\n".join(paginas)
+    except Exception as e:
+        logger.exception(
+            "❌ LlamaParse falhou em '%s': %s\n   A fazer fallback para pymupdf.",
+            caminho, e,
+        )
+        return _parsear_com_pymupdf(caminho)
 
 
 def _ler_txt(caminho: str) -> str:
@@ -490,44 +557,105 @@ def _ler_txt(caminho: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Chunking Hierárquico
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _criar_chunks(texto: str, nome_ficheiro: str, config: dict) -> Iterator[ChunkBruto]:
+    """
+    Divide o texto em chunks com prefixo hierárquico anti-alucinação.
+
+    Cada chunk começa com:
+      [EDITAL PAES 2026 | edital]
+      CURSO: Engenharia Civil | AC: 40 | PcD: 2 | TOTAL: 42
+
+    O LLM vê a fonte ANTES do conteúdo → ancora a resposta.
+    """
+    chunk_size  = config["chunk_size"]
+    overlap     = config["overlap"]
+    label       = config["label"]
+    doc_type    = config["doc_type"]
+    prefixo     = f"[{label} | {doc_type}]\n"
+
+    paragrafos  = _dividir_em_paragrafos(texto)
+    buffer      = ""
+    chunk_index = 0
+
+    for paragrafo in paragrafos:
+        paragrafo = paragrafo.strip()
+        if not paragrafo:
+            continue
+
+        if len(paragrafo) > chunk_size * 1.5:
+            if buffer.strip():
+                yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
+                chunk_index += 1
+                buffer = buffer[-overlap:] if overlap else ""
+            for parte in _dividir_em_sentencas(paragrafo, chunk_size, overlap):
+                yield _fazer_chunk(parte, prefixo, nome_ficheiro, doc_type, chunk_index)
+                chunk_index += 1
+            continue
+
+        candidato = buffer + ("\n" if buffer else "") + paragrafo
+        if len(candidato) <= chunk_size:
+            buffer = candidato
+        else:
+            if buffer.strip():
+                yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
+                chunk_index += 1
+            buffer = buffer[-overlap:] + "\n" + paragrafo if overlap else paragrafo
+
+    if buffer.strip():
+        yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
+
+
+def _fazer_chunk(texto_puro, prefixo, source, doc_type, chunk_index) -> ChunkBruto:
+    return ChunkBruto(
+        texto_puro=texto_puro.strip(),
+        texto_final=prefixo + texto_puro.strip(),
+        source=source,
+        doc_type=doc_type,
+        chunk_index=chunk_index,
+        metadata={"titulo_fonte": prefixo.strip("[]").split("|")[0].strip()},
+    )
+
+
+def _dividir_em_paragrafos(texto: str) -> list[str]:
+    blocos = re.split(r"\n{2,}", texto)
+    if len(blocos) > 3:
+        return blocos
+    return texto.split("\n")
+
+
+def _dividir_em_sentencas(texto: str, chunk_size: int, overlap: int) -> list[str]:
+    partes, inicio = [], 0
+    while inicio < len(texto):
+        fim    = inicio + chunk_size
+        if fim >= len(texto):
+            partes.append(texto[inicio:])
+            break
+        espaco = texto.rfind(" ", inicio, fim)
+        if espaco > inicio:
+            fim = espaco
+        partes.append(texto[inicio:fim].strip())
+        inicio = fim - overlap if overlap else fim
+    return [p for p in partes if p.strip()]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Limpeza de texto
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _limpar_texto(texto: str) -> str:
-    """
-    Remove ruído comum em PDFs da UEMA preservando estrutura de tabelas.
-
-    O QUE PRESERVAMOS:
-      - Pipes (|) → estrutura de tabelas do calendário e edital
-      - Maiúsculas → siglas (AC, BR-PPI, CECEN, PROG)
-      - Números e datas → críticos para anti-alucinação
-
-    O QUE REMOVEMOS:
-      - Cabeçalhos/rodapés repetidos (nome da universidade em cada página)
-      - Linhas de separação puras (---|---|---)
-      - Espaços e newlines excessivos
-    """
     if not texto:
         return ""
-
-    # Remove cabeçalho/rodapé repetido
     texto = re.sub(
         r"UNIVERSIDADE ESTADUAL DO MARANHÃO|www\.uema\.br|UEMA\s*[-–]\s*Campus",
         "", texto, flags=re.IGNORECASE,
     )
-
-    # Remove linhas de separação de tabela sem conteúdo (---|---|---)
     texto = re.sub(r"^[-|=\s]+$", "", texto, flags=re.MULTILINE)
-
-    # Remove linhas com apenas números e pipes (linhas de numeração de tabela)
     texto = re.sub(r"^\s*\|?\s*\d+\s*\|?\s*$", "", texto, flags=re.MULTILINE)
-
-    # Normaliza múltiplas linhas em branco
     texto = re.sub(r"\n{3,}", "\n\n", texto)
-
-    # Remove espaços no início/fim de cada linha mas preserva indentação
     texto = "\n".join(linha.rstrip() for linha in texto.splitlines())
-
     return texto.strip()
 
 
@@ -536,79 +664,44 @@ def _limpar_texto(texto: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _gerar_chunk_id(source: str, index: int) -> str:
-    """
-    Gera ID determinístico para o chunk.
-    Permite re-ingestão sem criar duplicados (mesma chave = overwrite).
-    """
-    base = f"{source}:{index}"
-    return hashlib.md5(base.encode()).hexdigest()[:16]
+    return hashlib.md5(f"{source}:{index}".encode()).hexdigest()[:16]
 
 
 def _sources_no_redis() -> set[str]:
-    """
-    Retorna o conjunto de sources únicos no Redis.
-
-    ESTRATÉGIA (duas abordagens por ordem de preferência):
-
-    1. FT.SEARCH com LIMIT 0 0 + GROUPBY (O(1) — usa o índice já criado)
-       Muito mais rápido que SCAN para colecções grandes.
-
-    2. Fallback: SCAN + JSON.get (caso o índice ainda não exista)
-       Seguro para a primeira execução antes de inicializar_indices() completar.
-
-    PORQUÊ IMPORTA:
-      Com 500 chunks, SCAN faz ~500 round-trips ao Redis.
-      FT.SEARCH com GROUPBY faz 1 operação → 500× mais rápido.
-      No startup, esta função é chamada 1× por ficheiro no PDF_CONFIG.
-    """
+    """Sources únicos no Redis — usa FT.AGGREGATE (rápido) com fallback SCAN."""
     from src.infrastructure.redis_client import IDX_CHUNKS
-    from redis.commands.search.aggregation import AggregateRequest
+    from redis.commands.search.aggregations import AggregateRequest
     from redis.commands.search.reducers import count as ft_count
 
     r = get_redis()
 
-    # ── Tentativa 1: FT.AGGREGATE via índice (rápido) ────────────────────────
     try:
-        req = AggregateRequest("*").group_by("@source", ft_count().alias("n"))
+        req      = AggregateRequest("*").group_by("@source", ft_count().alias("n"))
         resultado = r.ft(IDX_CHUNKS).aggregate(req)
-        sources = set()
+        sources  = set()
         for row in resultado.rows:
-            # row é uma lista plana: [campo, valor, campo, valor, ...]
-            it = iter(row)
+            it       = iter(row)
             row_dict = {k: v for k, v in zip(it, it)}
-            fonte = row_dict.get(b"source") or row_dict.get("source")
+            fonte    = row_dict.get(b"source") or row_dict.get("source")
             if fonte:
                 sources.add(fonte.decode() if isinstance(fonte, bytes) else str(fonte))
         return sources
     except Exception:
-        pass  # índice ainda não existe → usa fallback
+        pass
 
-    # ── Fallback: SCAN + JSON.get ─────────────────────────────────────────────
     sources: set[str] = set()
     cursor = 0
     while True:
         cursor, keys = r.scan(cursor, match=f"{PREFIX_CHUNKS}*", count=200)
         for key in keys:
             try:
-                doc = r.json().get(key, "$.source")
-                if doc:
-                    fonte = doc[0] if isinstance(doc, list) else doc
-                    if fonte:
-                        sources.add(str(fonte))
+                doc   = r.json().get(key, "$.source")
+                fonte = (doc[0] if isinstance(doc, list) else doc) if doc else None
+                if fonte:
+                    sources.add(str(fonte))
             except Exception:
                 pass
         if cursor == 0:
             break
 
     return sources
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Alias de compatibilidade (para código que importa de rag/ingestor.py)
-# ─────────────────────────────────────────────────────────────────────────────
-# Se ainda tens imports como `from src.rag.ingestor import Ingestor, PDF_CONFIG`
-# noutros ficheiros, podes criar um shim em ingestor.py:
-#
-#   from src.rag.ingestion import Ingestor, PDF_CONFIG  # noqa: F401
-#
-# Ou simplesmente actualiza os imports em main.py e debug_chainlit.py.

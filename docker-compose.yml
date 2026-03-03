@@ -1,70 +1,59 @@
 version: '3.8'
 
 # =============================================================================
-# docker-compose.yml — Bot UEMA v3.2
+# docker-compose.yml — Bot UEMA v3.3
 # =============================================================================
 #
-# CORRECÇÕES v3.2:
+# CORRECÇÕES v3.3:
 # ─────────────────
-#   1. CORRECÇÃO CRÍTICA: Evolution API v2 não suporta SQLite.
-#      A v2.0.0 migrou para Prisma ORM — só aceita postgresql ou mysql.
-#      Adicionado postgres:16-alpine EXCLUSIVO para a Evolution API.
-#      O bot RAG continua a usar APENAS Redis Stack (sem PostgreSQL para o bot).
+#   1. CORRECÇÃO PRINCIPAL: container_name do bot mudou de 'bot-rag' para 'bot'
+#      A Evolution API resolve o webhook por container_name na rede Docker.
+#      Com container_name=bot-rag, 'http://bot:9000/webhook' dava ECONNREFUSED
+#      porque 'bot' não resolvia para 'bot-rag'.
+#      Agora container_name=bot → 'http://bot:9000/webhook' funciona.
 #
-#   2. Evolution Manager configurado com VITE_API_URL para o browser Windows.
+#   2. Porta do CMD do uvicorn alinhada com a porta exposta (9000).
+#      O CMD no Dockerfile deve ser: uvicorn src.main:app --host 0.0.0.0 --port 9000
 #
-#   3. Porta do bot: 9000.
+#   3. Healthcheck simplificado — curl básico sem grep (mais fiável).
 #
-#   4. Rede 'bot': todos os serviços partilham a mesma rede bridge.
+#   4. Evolution API: WEBHOOK_EVENTS filtrados — só MESSAGES_UPSERT e
+#      CONNECTION_UPDATE para não inundar o bot com eventos desnecessários.
 #
-#   5. Volume 'evolution-pg-data' persiste o PostgreSQL da Evolution API.
-#
-#   6. Redis Stack: maxmemory via command (mais fiável que env).
-#
-# ---------------------------------------------------------------------------
-# ARQUITECTURA DE DADOS:
-#
-#   Redis Stack (DB 0) <-> Bot RAG
-#     chunks RAG, memória, vectores, routing semântico
-#
-#   PostgreSQL (evolution) <-> Evolution API
-#     instâncias WhatsApp, sessões Baileys, histórico de mensagens
-#
-#   Redis Stack (DB 1) <-> Evolution API (cache)
-#     cache de sessões — prefixo "evolution"
-#
-# ---------------------------------------------------------------------------
-# VARIÁVEIS NECESSÁRIAS NO .env:
-#   EVOLUTION_API_KEY=a_tua_chave_aqui
-#   EVOLUTION_DB_PASS=uma_password_segura   <- nova (ou usa o default abaixo)
+#   5. Evolution Manager removido — imagem quebrada (fs-extra ausente).
+#      Usa o manager nativo: http://localhost:8080/manager
 #
 # ---------------------------------------------------------------------------
 # PORTAS EXPOSTAS:
 #   6379  -> Redis Stack
 #   8001  -> RedisInsight  (http://localhost:8001)
-#   8080  -> Evolution API
-#   3001  -> Evolution Manager (http://localhost:3001)
-#   9000  -> Bot FastAPI
-#   PostgreSQL da Evolution NAO exposto ao host (so interno Docker)
+#   8080  -> Evolution API + Manager nativo (http://localhost:8080/manager)
+#   9000  -> Bot FastAPI   (http://localhost:9000/health)
+#   PostgreSQL NAO exposto (so interno Docker)
+#
+# NOMES DE SERVICO vs CONTAINER_NAME:
+#   servico: bot  →  container_name: bot  →  DNS interno Docker: bot
+#   servico: redis → container_name: redis-stack → DNS: redis (nome do servico)
+#   A Evolution resolve 'http://bot:9000' usando o nome do servico Docker.
 #
 # =============================================================================
 
 networks:
-  bot:
+  uema:
     driver: bridge
+    name: uema_network
 
 services:
 
   # ---------------------------------------------------------------------------
-  # 1. Redis Stack — Cache + Vector Store + Memory do Bot
-  #    RAM: ~120MB idle
+  # 1. Redis Stack
   # ---------------------------------------------------------------------------
   redis:
     image: redis/redis-stack:latest
     container_name: redis-stack
     restart: unless-stopped
     networks:
-      - bot
+      - uema
     ports:
       - "6379:6379"
       - "8001:8001"
@@ -75,33 +64,27 @@ services:
       --maxmemory 2gb
       --maxmemory-policy allkeys-lru
       --save 60 1000
-      --save 300 100
       --appendonly no
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
-      start_period: 20s
+      start_period: 15s
 
   # ---------------------------------------------------------------------------
   # 2. PostgreSQL — EXCLUSIVO da Evolution API
-  #
-  #    A Evolution API v2 usa Prisma ORM: so suporta postgresql ou mysql.
-  #    SQLite foi removido na v2.0.0.
-  #    Este Postgres NAO e usado pelo bot RAG.
-  #    RAM: ~25MB idle (postgres:16-alpine).
   # ---------------------------------------------------------------------------
   evolution-postgres:
     image: postgres:16-alpine
-    container_name: evolution_postgres
+    container_name: evolution-postgres
     restart: unless-stopped
     networks:
-      - bot
+      - uema
     environment:
       - POSTGRES_DB=evolution
       - POSTGRES_USER=evolution
-      - POSTGRES_PASSWORD=${EVOLUTION_DB_PASS:-evo_pass_segura_2024}
+      - POSTGRES_PASSWORD=${EVOLUTION_DB_PASS:-evo_pass_2024}
     volumes:
       - evolution-pg-data:/var/lib/postgresql/data
     healthcheck:
@@ -112,43 +95,57 @@ services:
       start_period: 15s
 
   # ---------------------------------------------------------------------------
-  # 3. Evolution API v2 — Motor WhatsApp
-  #
-  #    DATABASE_PROVIDER=postgresql (SQLite invalido na v2)
+  # 3. Evolution API v2
   # ---------------------------------------------------------------------------
   evolution-api:
-    image: atendai/evolution-api:v2.1.1
-    container_name: evolution_api
+    build:
+      context: https://github.com/EvolutionAPI/evolution-api.git#2.3.7
+      dockerfile: ./Dockerfile
+    image: evolution-api-local:2.3.7  # Build local da tag 2.3.7 (fix @lid)
+    container_name: evolution-api
     restart: unless-stopped
     networks:
-      - bot
+      - uema
     ports:
       - "8080:8080"
     environment:
       - SERVER_URL=http://localhost:8080
       - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
 
-      # Base de dados PostgreSQL (obrigatorio na v2)
+      # PostgreSQL (obrigatorio na v2 — SQLite removido)
       - DATABASE_ENABLED=true
       - DATABASE_PROVIDER=postgresql
-      - DATABASE_CONNECTION_URI=postgresql://evolution:${EVOLUTION_DB_PASS:-evo_pass_segura_2024}@evolution-postgres:5432/evolution
+      - DATABASE_CONNECTION_URI=postgresql://evolution:${EVOLUTION_DB_PASS:-evo_pass_2024}@evolution-postgres:5432/evolution
       - DATABASE_CONNECTION_CLIENT_NAME=evolution_api
       - DATABASE_SAVE_DATA_INSTANCE=true
-      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
-      - DATABASE_SAVE_MESSAGE_UPDATE=true
-      - DATABASE_SAVE_DATA_CONTACTS=true
-      - DATABASE_SAVE_DATA_CHATS=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=false
+      - DATABASE_SAVE_MESSAGE_UPDATE=false
+      - DATABASE_SAVE_DATA_CONTACTS=false
+      - DATABASE_SAVE_DATA_CHATS=false
 
-      # Cache Redis DB 1 (bot usa DB 0 — sem conflito)
+      # Cache Redis DB 1
       - CACHE_REDIS_ENABLED=true
       - CACHE_REDIS_URI=redis://redis:6379/1
       - CACHE_REDIS_PREFIX_KEY=evolution
       - CACHE_REDIS_SAVE_INSTANCES=false
 
-      # Webhook aponta para o bot
+      # Webhook — aponta para o bot pelo nome do servico Docker
+      # IMPORTANTE: usar nome do servico 'bot', nao container_name
       - WEBHOOK_GLOBAL_URL=http://bot:9000/webhook
       - WEBHOOK_GLOBAL_ENABLED=true
+      # Filtrar apenas eventos necessarios — reduz trafego desnecessario
       - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+      - WEBHOOK_EVENTS_MESSAGES_UPDATE=false
+      - WEBHOOK_EVENTS_MESSAGES_DELETE=false
+      - WEBHOOK_EVENTS_SEND_MESSAGE=false
+      - WEBHOOK_EVENTS_CONTACTS_UPDATE=false
+      - WEBHOOK_EVENTS_CONTACTS_UPSERT=false
+      - WEBHOOK_EVENTS_PRESENCE_UPDATE=false
+      - WEBHOOK_EVENTS_CHATS_UPDATE=false
+      - WEBHOOK_EVENTS_CHATS_UPSERT=false
+      - WEBHOOK_EVENTS_CONNECTION_UPDATE=true
+      - WEBHOOK_EVENTS_GROUPS_UPSERT=false
+      - WEBHOOK_EVENTS_GROUPS_UPDATE=false
       - CONFIG_SESSION_PHONE_VERSION=2.3000.1032691661
 
     volumes:
@@ -166,33 +163,17 @@ services:
       start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # 4. Evolution Manager — Painel Web
-  #    http://localhost:3001
-  #    Alternativa nativa: http://localhost:8080/manager
-  # ---------------------------------------------------------------------------
-  evolution-manager:
-    image: atendai/evolution-manager:latest
-    container_name: evolution_manager
-    restart: unless-stopped
-    networks:
-      - bot
-    ports:
-      - "3001:80"
-    environment:
-      - VITE_API_URL=http://localhost:8080
-      # - VITE_GLOBAL_API_KEY=${EVOLUTION_API_KEY}
-    depends_on:
-      - evolution-api
-
-  # ---------------------------------------------------------------------------
-  # 5. Bot RAG — Aplicacao principal
+  # 4. Bot RAG
+  #
+  # CRITICO: container_name=bot para que 'http://bot:9000' resolva correctamente
+  # O nome do servico Docker ('bot') e o container_name devem ser IGUAIS.
   # ---------------------------------------------------------------------------
   bot:
     build: .
-    container_name: bot-rag
+    container_name: bot
     restart: unless-stopped
     networks:
-      - bot
+      - uema
     depends_on:
       redis:
         condition: service_healthy
@@ -213,12 +194,9 @@ services:
       test: ["CMD-SHELL", "curl -sf http://localhost:9000/health || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
+      retries: 5
       start_period: 120s
 
-# =============================================================================
-# Volumes
-# =============================================================================
 volumes:
   redis-data:
     driver: local

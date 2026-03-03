@@ -247,7 +247,7 @@ def _busca_tool_semantica(texto: str) -> ResultadoRoteamento | None:
         Convertemos para SIMILARIDADE: similarity = 1 - (distance / 2)
         Normalizado: 1.0 = idêntico, 0.0 = completamente diferente
     """
-    from src.rag.vector_store import get_embeddings  # Import local
+    from src.rag.embeddings import get_embeddings  # Import local
     from redis.commands.search.query import Query
 
     embeddings_model = get_embeddings()

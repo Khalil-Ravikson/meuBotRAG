@@ -260,7 +260,7 @@ def _buscar_para_query(
     """
     # Computa embedding da query (CPU local, ~5ms)
     try:
-        from src.rag.vector_store import get_embeddings
+        from src.rag.embeddings import get_embeddings
         embeddings_model = get_embeddings()
         vetor_query = embeddings_model.embed_query(query)
     except Exception as e:

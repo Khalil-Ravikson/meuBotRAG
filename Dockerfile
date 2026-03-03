@@ -55,8 +55,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # 6. Expõe a porta da API
-EXPOSE 8000
-
+EXPOSE 9000
 # 7. Comando de inicialização
 #    --reload: hot-reload ativo (remova em produção)
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "9000", "--reload"]
