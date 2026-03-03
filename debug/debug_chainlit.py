@@ -1,92 +1,99 @@
 """
-debug/debug_chainlit.py — Painel de Debug (v3)
-===============================================
+debug/debug_chainlit.py — Painel de Debug (v3 — Clean Architecture)
+====================================================================
 
-CORREÇÃO v2 — Problema de módulos não encontrados:
-  O Chainlit roda na sua MÁQUINA LOCAL (fora do Docker).
-  O Docker tem seus próprios Redis e pgvector nos IPs internos do container.
-  Para o Chainlit funcionar na sua máquina, você precisa:
+O QUE MUDOU vs v2:
+─────────────────────
+  REMOVIDO:
+    - Imports de AgentState, montar_prompt_enriquecido (agent/prompts.py)
+    - Import de domain/router.py (analisar) — agora é interno ao semantic_router
+    - Import de rag/vector_store.py (diagnosticar) — substituído por Redis
+    - Referências a settings.GROQ_MODEL, settings.LANGCHAIN_PROJECT
+    - Referências a DATABASE_URL (pgvector eliminado)
+    - Modo "direto" antigo (usava AgentState directamente)
+    - Verificação agent_core._agent_with_history
 
-    1. Redis e pgvector expostos no localhost (já está no docker-compose.yml):
-       db    → localhost:5433
-       redis → localhost:6379
+  ADICIONADO:
+    - Status do Redis Stack (módulos RedisSearch + RedisJSON)
+    - settings.GEMINI_MODEL nos logs
+    - /fatos no painel de diagnóstico (long-term memory)
+    - /memoria no painel de diagnóstico (working memory)
+    - Comando /fatos para ver fatos do utilizador de debug
+    - Comando /extracao para forçar extração de fatos
+    - Modo "direto" redesenhado para nova API do AgentCore
+    - Verificação agent_core._inicializado
 
-    2. Um arquivo .env.local na raiz com os hosts corretos:
-       DATABASE_URL=postgresql+psycopg://postgres:senha@localhost:5433/vectordb
-       REDIS_URL=redis://localhost:6379/0
-       WAHA_BASE_URL=http://localhost:3000
+  MANTIDO:
+    - Estrutura de comandos (/ajuda, /status, /limpar, /ingerir, /exportar)
+    - Modo agente (adaptado à nova assinatura do AgentCore)
+    - Sistema de log de sessão
 
-    3. Dependências instaladas no venv local:
-       pip install chainlit tiktoken langchain-groq langchain-postgres
-       pip install langchain-huggingface langchain-community redis psycopg
+COMO CORRER (igual ao anterior):
+──────────────────────────────────
+  # Sempre da RAIZ do projecto:
+  cd /caminho/para/meuBotRAG
 
-  O Chainlit usa o .env.local automaticamente (via DOTENV_PATH abaixo).
+  # Activa o venv com as dependências:
+  source .venv/bin/activate
 
-USO:
-  cd /caminho/para/meuBotRAG    ← sempre da RAIZ do projeto
+  # Instala dependências extra para debug local:
+  pip install chainlit tiktoken google-genai redis[hiredis]
+
+  # Redis Stack deve estar a correr (via Docker ou local):
+  # docker run -p 6379:6379 redis/redis-stack:latest
+
+  # Cria .env.local com hosts de localhost:
+  # REDIS_URL=redis://localhost:6379/0
+  # GEMINI_API_KEY=...
+  # (sem DATABASE_URL — pgvector eliminado)
+
+  # Corre o Chainlit:
   chainlit run debug/debug_chainlit.py --port 8001
 
-COMANDOS NO CHAT:
-  /ajuda · /status · /limpar · /diagnostico
-  /modo agente · /modo direto · /ingerir · /exportar
+NOTA SOBRE O DOCKER:
+──────────────────────
+  Este script corre na máquina LOCAL (fora do Docker).
+  O Redis Stack no Docker expõe a porta 6379 → usas REDIS_URL=redis://localhost:6379/0
+  O bot FastAPI no Docker está em localhost:8000
+  Os PDFs ingeridos no Docker estão no Redis → o Chainlit acede ao mesmo Redis
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import sys
 import time
-import asyncio
-import logging
 from datetime import datetime
 from pathlib import Path
 
 # ── Verificação de versão ─────────────────────────────────────────────────────
-# Chainlit suporta 3.9 a 3.12. Python 3.12 funciona normalmente no Windows.
 if sys.version_info >= (3, 13):
-    print("❌  Python 3.13+ não suportado pelo Chainlit.")
-    print("    Use 3.11 ou 3.12.")
+    print("❌  Python 3.13+ não suportado pelo Chainlit. Use 3.11 ou 3.12.")
     sys.exit(1)
 
-# ── Resolve raiz do projeto ───────────────────────────────────────────────────
-# Funciona rodando de debug/ ou da raiz
+# ── Resolve raiz do projecto ──────────────────────────────────────────────────
 _AQUI = Path(__file__).resolve().parent
 _RAIZ = _AQUI.parent if _AQUI.name == "debug" else _AQUI
 
 if str(_RAIZ) not in sys.path:
     sys.path.insert(0, str(_RAIZ))
 
-# ── .env local para Chainlit (fora do Docker) ─────────────────────────────────
-# Carrega .env.local se existir, senão usa .env padrão
-# .env.local deve ter hosts de localhost em vez de nomes de serviço Docker
+# ── Carrega .env.local se existir, senão usa .env ─────────────────────────────
 _ENV_LOCAL  = _RAIZ / ".env.local"
 _ENV_PADRAO = _RAIZ / ".env"
-_ENV_FILE   = str(_ENV_LOCAL if _ENV_LOCAL.exists() else _ENV_PADRAO)
-os.environ["ENV_FILE_PATH"] = _ENV_FILE   # lido pelo settings.py se configurado
 
-# Sobrescreve o env_file do pydantic-settings antes de importar settings
-# (funciona porque settings usa @lru_cache — ainda não foi chamado)
 if _ENV_LOCAL.exists():
-    # Força o pydantic-settings a usar .env.local
-    # Técnica: define as variáveis no ambiente antes de importar settings
     from dotenv import dotenv_values
-    _local_vars = dotenv_values(_ENV_LOCAL)
-    for k, v in _local_vars.items():
+    for k, v in dotenv_values(_ENV_LOCAL).items():
         if v is not None and k not in os.environ:
             os.environ[k] = v
     print(f"🔧 Chainlit usando: {_ENV_LOCAL}")
 else:
     print(f"🔧 Chainlit usando: {_ENV_PADRAO}")
-    print("   💡 Crie .env.local com hosts de localhost para isolamento do Docker")
+    print("   💡 Cria .env.local com REDIS_URL=redis://localhost:6379/0 e GEMINI_API_KEY=...")
 
-# ── Desativa o ChainlitDataLayer (banco interno do Chainlit) ─────────────────
-# O Chainlit por padrão tenta conectar num banco próprio (asyncpg) para salvar
-# histórico de sessões. No Windows/local ele não tem esse banco configurado,
-# causando dezenas de "ConnectionRefusedError: WinError 1225" nos logs.
-#
-# Solução: define CHAINLIT_AUTH_SECRET como string vazia antes de importar
-# chainlit. Com isso, o Chainlit opera sem persistência — perfeito para debug.
-#
-# Isso NÃO afeta o funcionamento do agente, Redis ou pgvector do projeto.
+# ── Desactiva o ChainlitDataLayer ─────────────────────────────────────────────
 os.environ.setdefault("CHAINLIT_AUTH_SECRET", "")
 
 import chainlit as cl
@@ -94,35 +101,39 @@ import chainlit as cl
 # ── Imports dos módulos de produção ───────────────────────────────────────────
 _MODULOS_OK  = True
 _ERRO_IMPORT = None
+
 try:
-    from src.infrastructure.settings     import settings
-    print("DEBUG DATABASE_URL:", settings.DATABASE_URL)
+    from src.infrastructure.settings    import settings
     from src.infrastructure.observability import obs
+    from src.infrastructure.redis_client import redis_ok, inicializar_indices
     from src.agent.core                  import agent_core
-    from src.agent.state                 import AgentState
-    from src.agent.prompts               import montar_prompt_enriquecido
     from src.domain.menu                 import processar_mensagem
-    from src.domain.router               import analisar
     from src.domain.entities             import EstadoMenu
     from src.memory.redis_memory         import (
-        get_estado_menu, set_estado_menu, clear_estado_menu,
-        get_contexto, set_contexto, clear_tudo,
+        get_estado_menu, set_estado_menu, clear_estado_menu, clear_tudo,
     )
+    # Módulos novos (v3)
+    from src.memory.working_memory       import (
+        get_historico_compactado, get_sinais, limpar_sessao,
+    )
+    from src.memory.long_term_memory     import listar_todos_fatos
+    from src.memory.memory_extractor     import forcar_extracao, testar_extracao
+    from src.domain.semantic_router      import testar_roteamento, listar_tools_registadas
     from src.rag.ingestor                import Ingestor, PDF_CONFIG
-    from src.rag.vector_store            import diagnosticar as vs_diagnosticar
     from src.tools                       import get_tools_ativas
+
 except ImportError as e:
     _MODULOS_OK  = False
     _ERRO_IMPORT = str(e)
     print(f"\n❌ Erro ao importar módulos: {e}")
     print("\nVerifique:")
-    print("  1. Você está na RAIZ do projeto (não dentro de debug/)")
-    print("  2. O venv está ativo com todas as dependências:")
-    print("     pip install -r requirements.txt chainlit tiktoken")
-    print("  3. O .env.local tem DATABASE_URL e REDIS_URL com localhost")
-    print("     (não nomes de serviço Docker como 'db' ou 'redis')")
+    print("  1. Estás na RAIZ do projecto (não dentro de debug/)")
+    print("  2. O venv está activo:")
+    print("     pip install -r requirements.txt chainlit tiktoken google-genai")
+    print("  3. O .env.local tem REDIS_URL=redis://localhost:6379/0")
+    print("  4. O Redis Stack está a correr: docker run -p 6379:6379 redis/redis-stack:latest")
 
-# ── Contador de tokens ─────────────────────────────────────────────────────────
+# ── Estimador de tokens (sem tiktoken obrigatório) ────────────────────────────
 try:
     import tiktoken
     _enc = tiktoken.get_encoding("cl100k_base")
@@ -130,22 +141,26 @@ try:
         return len(_enc.encode(str(t)))
 except Exception:
     def _tokens(t: str) -> int:
-        return len(str(t)) // 4
+        return len(str(t)) // 4   # Estimativa conservadora para português
 
 logging.basicConfig(level=logging.WARNING)
 
-_DEBUG_USER = "debug_chainlit"
+_DEBUG_USER    = "debug_chainlit"
+_DEBUG_SESSION = "debug_chainlit"
 
 
 # =============================================================================
-# Estado da sessão
+# Estado da sessão Chainlit
 # =============================================================================
 
 def _novo_estado() -> dict:
     return {
-        "modo": "agente",
+        "modo":        "agente",
         "iniciado_em": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "msgs": 0, "tokens": 0, "latencia_total": 0, "log": [],
+        "msgs":        0,
+        "tokens":      0,
+        "latencia_total": 0,
+        "log":         [],
     }
 
 
@@ -157,61 +172,61 @@ def _novo_estado() -> dict:
 async def on_start():
     cl.user_session.set("s", _novo_estado())
 
+    # ── Mostra erro de import se aconteceu ────────────────────────────────────
     if not _MODULOS_OK:
-        env_dica = (
-            "`.env.local` encontrado ✅"
-            if (_RAIZ / ".env.local").exists()
-            else "`.env.local` **não encontrado** — crie com hosts de localhost"
-        )
         await cl.Message(content=(
             f"⚠️ **Módulos não carregados**\n\n```\n{_ERRO_IMPORT}\n```\n\n"
-            f"**Arquivo de configuração:** {env_dica}\n\n"
             "**Checklist:**\n"
             "```bash\n"
-            "# 1. Rode da raiz do projeto\n"
-            "cd /caminho/para/meuBotRAG\n\n"
-            "# 2. Ative o venv com as dependências\n"
+            "cd /caminho/para/meuBotRAG\n"
             "source .venv/bin/activate\n"
-            "pip install chainlit tiktoken langchain-groq langchain-postgres\n"
-            "pip install langchain-huggingface langchain-community redis psycopg\n\n"
-            "# 3. Crie o .env.local (hosts de localhost, não Docker)\n"
-            "cp .env .env.local\n"
-            "# Edite .env.local:\n"
-            "# DATABASE_URL=postgresql+psycopg://postgres:senha@localhost:5433/vectordb\n"
-            "# REDIS_URL=redis://localhost:6379/0\n\n"
-            "# 4. Rode novamente\n"
+            "pip install -r requirements.txt chainlit tiktoken google-genai\n\n"
+            "# Cria .env.local:\n"
+            "echo 'REDIS_URL=redis://localhost:6379/0' > .env.local\n"
+            "echo 'GEMINI_API_KEY=tua_chave_aqui' >> .env.local\n\n"
+            "# Inicia Redis Stack (noutra terminal):\n"
+            "docker run -p 6379:6379 redis/redis-stack:latest\n\n"
             "chainlit run debug/debug_chainlit.py --port 8001\n"
             "```"
         )).send()
         return
 
-    # Inicializa o agente se necessário
-    if not agent_core._agent_with_history:
-        async with cl.Step(name="🔧 Inicializando agente") as step:
+    # ── Inicializa agente se necessário ──────────────────────────────────────
+    if not agent_core._inicializado:
+        async with cl.Step(name="🔧 Inicializando agente v3") as step:
             try:
+                # Cria índices Redis Stack
+                await asyncio.to_thread(inicializar_indices)
+
+                # Ingere PDFs se necessário
                 ingestor = Ingestor()
                 await asyncio.to_thread(ingestor.ingerir_se_necessario)
+
+                # Inicializa AgentCore com tools
                 tools = get_tools_ativas()
                 await asyncio.to_thread(agent_core.inicializar, tools)
-                step.output = f"✅ {len(tools)} tools | {settings.GROQ_MODEL}"
+
+                step.output = f"✅ {len(tools)} tools | {settings.GEMINI_MODEL} | Redis Stack"
             except Exception as e:
                 step.output = f"❌ {e}"
+                await cl.Message(content=f"⚠️ Erro ao inicializar: {e}").send()
+                return
 
-    ls = (
-        f"✅ [ver traces](https://smith.langchain.com) → `{settings.LANGCHAIN_PROJECT}`"
-        if settings.langsmith_ativo else "❌ desativado"
-    )
-    env_msg = "`.env.local`" if (_RAIZ / ".env.local").exists() else "`.env`"
+    # ── Mensagem de boas-vindas ───────────────────────────────────────────────
+    redis_status = "✅" if redis_ok() else "❌"
+    env_msg      = "`.env.local`" if _ENV_LOCAL.exists() else "`.env`"
+    tools_reg    = listar_tools_registadas() if _MODULOS_OK else []
 
     await cl.Message(content=(
-        "## 🎓 Debug — Agente UEMA\n\n"
-        f"**Modo:** `agente` &nbsp;|&nbsp; **Modelo:** `{settings.GROQ_MODEL}`\n\n"
+        "## 🎓 Debug — Agente UEMA v3\n\n"
         f"**Config:** {env_msg} &nbsp;|&nbsp; "
-        f"**DB:** `{settings.DATABASE_URL.split('@')[-1]}`\n\n"
-        f"**LangSmith:** {ls}\n"
-        f"**HF_TOKEN:** {'✅' if settings.HF_TOKEN else '⚠️ ausente'}\n\n"
-        "---\nDigite ou use: "
-        "`/ajuda` · `/status` · `/limpar` · `/diagnostico` · `/modo direto` · `/ingerir`"
+        f"**Modelo:** `{settings.GEMINI_MODEL}`\n\n"
+        f"**Redis Stack:** {redis_status} `{settings.REDIS_URL}`\n"
+        f"**Tools registadas:** {', '.join(f'`{t}`' for t in tools_reg) or '(nenhuma)'}\n"
+        f"**pgvector:** ❌ eliminado (Redis Stack faz tudo)\n\n"
+        "---\n"
+        "**Comandos:** `/ajuda` · `/status` · `/limpar` · `/diagnostico` "
+        "· `/fatos` · `/extracao` · `/router [query]` · `/ingerir` · `/exportar`"
     )).send()
 
 
@@ -227,7 +242,7 @@ async def on_message(message: cl.Message):
     if texto.startswith("/"):
         await _cmd(texto, s)
     elif not _MODULOS_OK:
-        await cl.Message(content="⚠️ Módulos não carregados. Veja o erro no início.").send()
+        await cl.Message(content="⚠️ Módulos não carregados. Vê o erro no início.").send()
     elif s["modo"] == "agente":
         await _modo_agente(texto, s)
     else:
@@ -241,172 +256,278 @@ async def on_message(message: cl.Message):
 # =============================================================================
 
 async def _modo_agente(texto: str, s: dict) -> None:
+    """
+    Fluxo completo: menu → AgentCore v3 (Gemini + Redis).
+    Mostra métricas de cada passo no painel.
+    """
     t0        = time.time()
     modo_menu = get_estado_menu(_DEBUG_USER)
     resultado = processar_mensagem(texto, modo_menu)
 
+    # ── Navegação de menu directa ─────────────────────────────────────────────
     if resultado["type"] in ("menu_principal", "submenu"):
         set_estado_menu(_DEBUG_USER, resultado["novo_estado"])
         await cl.Message(content=resultado["content"], author="📋 Menu").send()
         _log(s, texto, resultado["content"], 0, "menu")
         return
 
+    # ── Actualiza estado do menu ──────────────────────────────────────────────
     novo = resultado["novo_estado"]
-    if novo == EstadoMenu.MAIN:
-        clear_estado_menu(_DEBUG_USER)
-    else:
-        set_estado_menu(_DEBUG_USER, novo)
+    if novo != modo_menu:
+        if novo == EstadoMenu.MAIN:
+            clear_estado_menu(_DEBUG_USER)
+        else:
+            set_estado_menu(_DEBUG_USER, novo)
 
-    prompt_base  = resultado["prompt"] or texto
-    rota         = analisar(prompt_base, modo_menu)
-    ctx          = get_contexto(_DEBUG_USER)
-    prompt_final = montar_prompt_enriquecido(prompt_base, rota, ctx)
+    texto_para_agente = resultado.get("prompt") or texto
 
+    # ── Mostra info de roteamento antes de chamar o agente ────────────────────
     await cl.Message(
-        content=f"`🔍 Rota: {rota.value}` · `Menu: {modo_menu.value}`",
-        author="Router"
+        content=f"`🗺️ Estado menu: {modo_menu.value}` · `Texto: {texto_para_agente[:50]}`",
+        author="Pre-Pipeline",
     ).send()
 
-    state = AgentState(
-        user_id=_DEBUG_USER, session_id=_DEBUG_USER,
-        mensagem_original=texto, chat_id="debug",
-        rota=rota, modo_menu=modo_menu,
-        prompt_enriquecido=prompt_final, contexto_usuario=ctx,
-        max_iteracoes=settings.AGENT_MAX_ITERATIONS,
-    )
-
-    async with cl.Step(name=f"🤖 Agent [{rota.value}]") as step:
-        resp     = await asyncio.to_thread(agent_core.responder, state)
+    # ── Chama o novo AgentCore v3 ─────────────────────────────────────────────
+    async with cl.Step(name="🤖 AgentCore v3 [Gemini + Redis]") as step:
+        resp     = await asyncio.to_thread(
+            agent_core.responder,
+            user_id=_DEBUG_USER,
+            session_id=_DEBUG_SESSION,
+            mensagem=texto_para_agente,
+            estado_menu=modo_menu,
+        )
         latencia = int((time.time() - t0) * 1000)
-        toks     = _tokens(texto) + _tokens(resp.conteudo)
-        step.output = f"**{latencia}ms** · ~{toks} tokens · {'✅' if resp.sucesso else '❌'}"
+        toks_in  = resp.tokens_entrada
+        toks_out = resp.tokens_saida
 
-    set_contexto(_DEBUG_USER, {"ultima_intencao": rota.value})
+        step.output = (
+            f"**{latencia}ms** · "
+            f"in={toks_in} out={toks_out} total={toks_in + toks_out} tokens · "
+            f"rota={resp.rota.value} · "
+            f"{'✅' if resp.sucesso else '❌'}"
+        )
+
     await cl.Message(content=resp.conteudo).send()
-    _log(s, texto, resp.conteudo, latencia, f"agente/{rota.value}")
+    _log(s, texto, resp.conteudo, latencia, f"agente/{resp.rota.value}")
 
 
 async def _modo_direto(texto: str, s: dict) -> None:
-    t0    = time.time()
-    state = AgentState(
-        user_id=_DEBUG_USER, session_id=_DEBUG_USER,
-        mensagem_original=texto, chat_id="debug",
-    )
-    async with cl.Step(name="🤖 Agent [direto]") as step:
-        resp     = await asyncio.to_thread(agent_core.responder, state)
+    """
+    Modo direto (sem menu): chama o AgentCore directamente com EstadoMenu.MAIN.
+    Útil para testar o pipeline RAG puro sem lógica de menu.
+    """
+    t0 = time.time()
+    async with cl.Step(name="🤖 AgentCore [modo direto]") as step:
+        resp     = await asyncio.to_thread(
+            agent_core.responder,
+            user_id=_DEBUG_USER,
+            session_id=_DEBUG_SESSION,
+            mensagem=texto,
+            estado_menu=EstadoMenu.MAIN,
+        )
         latencia = int((time.time() - t0) * 1000)
-        step.output = f"**{latencia}ms** · {'✅' if resp.sucesso else '❌'}"
+        step.output = f"**{latencia}ms** · rota={resp.rota.value} · {'✅' if resp.sucesso else '❌'}"
+
     await cl.Message(content=resp.conteudo).send()
-    _log(s, texto, resp.conteudo, latencia, "direto")
+    _log(s, texto, resp.conteudo, latencia, f"direto/{resp.rota.value}")
 
 
-def _log(s: dict, p: str, r: str, lat: int, modo: str):
-    s["msgs"] += 1; s["tokens"] += _tokens(p) + _tokens(r); s["latencia_total"] += lat
-    s["log"].append({"ts": datetime.now().strftime("%H:%M:%S"), "modo": modo,
-                     "latencia": lat, "pergunta": p, "resposta": r})
+def _log(s: dict, p: str, r: str, lat: int, modo: str) -> None:
+    s["msgs"]          += 1
+    s["tokens"]        += _tokens(p) + _tokens(r)
+    s["latencia_total"] += lat
+    s["log"].append({
+        "ts":       datetime.now().strftime("%H:%M:%S"),
+        "modo":     modo,
+        "latencia": lat,
+        "pergunta": p,
+        "resposta": r,
+    })
 
 
 # =============================================================================
-# Comandos
+# Comandos /cmd
 # =============================================================================
 
 async def _cmd(texto: str, s: dict) -> None:
     partes = texto.lower().split()
     cmd    = partes[0]
 
+    # ── /ajuda ────────────────────────────────────────────────────────────────
     if cmd == "/ajuda":
         await cl.Message(content=(
-            "## Comandos\n\n"
+            "## Comandos disponíveis\n\n"
             "| Comando | Descrição |\n|---|---|\n"
             "| `/ajuda` | Esta mensagem |\n"
-            "| `/status` | Config, LangSmith, HF_TOKEN, métricas |\n"
-            "| `/limpar` | Limpa histórico Redis + estado do menu |\n"
-            "| `/diagnostico` | Sources no banco vetorial |\n"
-            "| `/modo agente` | Fluxo completo: menu → router → agente |\n"
-            "| `/modo direto` | Só o agente, sem menu/router |\n"
-            "| `/ingerir` | Força re-ingestão dos PDFs |\n"
-            "| `/exportar` | Baixa log da sessão em .txt |\n"
+            "| `/status` | Estado do sistema (Redis, Gemini, tools) |\n"
+            "| `/limpar` | Limpa working memory + estado menu da sessão |\n"
+            "| `/diagnostico` | Verifica sources no Redis |\n"
+            "| `/fatos` | Lista fatos long-term do utilizador de debug |\n"
+            "| `/extracao` | Força extração de fatos da conversa atual |\n"
+            "| `/router <query>` | Testa o semantic router para uma query |\n"
+            "| `/modo agente` | Fluxo completo: menu → AgentCore v3 |\n"
+            "| `/modo direto` | Só o AgentCore, sem lógica de menu |\n"
+            "| `/ingerir` | Força re-ingestão dos PDFs no Redis |\n"
+            "| `/exportar` | Exporta log da sessão em .txt |\n"
         )).send()
 
+    # ── /status ───────────────────────────────────────────────────────────────
     elif cmd == "/status":
-        msgs = s["msgs"]
-        lat  = (s["latencia_total"] // msgs) if msgs else 0
-        ls   = (f"✅ `{settings.LANGCHAIN_PROJECT}`" if settings.langsmith_ativo else "❌")
-        db_host = settings.DATABASE_URL.split("@")[-1] if "@" in settings.DATABASE_URL else "?"
+        msgs     = s["msgs"]
+        lat_med  = (s["latencia_total"] // msgs) if msgs else 0
+        tools    = listar_tools_registadas() if _MODULOS_OK else []
+
         await cl.Message(content=(
-            f"## Status\n\n"
-            f"**Modo:** `{s['modo']}` · **Modelo:** `{settings.GROQ_MODEL}`\n"
-            f"**Agente:** {'✅' if agent_core._agent_with_history else '❌'}\n"
-            f"**DB host:** `{db_host}`\n"
-            f"**Redis:** `{settings.REDIS_URL}`\n"
-            f"**LangSmith:** {ls} · **HF_TOKEN:** {'✅' if settings.HF_TOKEN else '⚠️'}\n\n"
-            f"**Sessão:** {msgs} msgs · ~{s['tokens']} tokens · lat. média {lat}ms\n"
+            f"## Status — Bot UEMA v3\n\n"
+            f"**Modo:** `{s['modo']}` &nbsp;|&nbsp; "
+            f"**Modelo:** `{settings.GEMINI_MODEL}`\n\n"
+            f"**AgentCore:** {'✅ pronto' if agent_core._inicializado else '❌ não inicializado'}\n"
+            f"**Redis Stack:** {'✅' if redis_ok() else '❌'} `{settings.REDIS_URL}`\n"
+            f"**pgvector:** ❌ eliminado\n"
+            f"**HF_TOKEN:** {'✅' if settings.HF_TOKEN else '⚠️ ausente (download anónimo)'}\n\n"
+            f"**Tools registadas ({len(tools)}):** {', '.join(f'`{t}`' for t in tools)}\n\n"
+            f"**Sessão:** {msgs} msgs · ~{s['tokens']} tokens · lat. média {lat_med}ms\n"
             f"**Iniciado:** {s['iniciado_em']}\n"
         )).send()
 
+    # ── /limpar ───────────────────────────────────────────────────────────────
     elif cmd == "/limpar":
         if _MODULOS_OK:
+            # Limpa working memory (nova) + estado menu + contexto antigo
+            await asyncio.to_thread(limpar_sessao, _DEBUG_SESSION)
             clear_tudo(_DEBUG_USER)
-            await cl.Message(content="🗑️ Histórico + estado do menu limpos.").send()
+            await cl.Message(content="🗑️ Working memory + estado menu + fatos de sessão limpos.").send()
 
+    # ── /diagnostico ──────────────────────────────────────────────────────────
     elif cmd == "/diagnostico":
         if not _MODULOS_OK:
             await cl.Message(content="⚠️ Módulos não carregados.").send()
             return
-        async with cl.Step(name="🔍 Verificando banco") as step:
-            sources = await asyncio.to_thread(vs_diagnosticar)
-            step.output = str(sources)
+
+        async with cl.Step(name="🔍 Verificando Redis Stack") as step:
+            ingestor = Ingestor()
+            sources  = await asyncio.to_thread(ingestor.diagnosticar)
+            step.output = f"Sources encontrados: {sources}"
+
         esperados = set(PDF_CONFIG.keys())
         faltam    = esperados - sources
-        linhas    = ["### Sources no banco\n"]
+        linhas    = ["### Sources no Redis\n"]
         for src in sorted(sources):
             linhas.append(f"- `{src}` {'✅' if src in esperados else '⚠️ não esperado'}")
         if faltam:
             linhas.append(f"\n❌ **Faltam:** {', '.join(f'`{f}`' for f in faltam)}")
-            linhas.append("\n💡 Use `/ingerir` para processar os PDFs ausentes.")
+            linhas.append("💡 Use `/ingerir` para processar os PDFs em falta.")
         else:
-            linhas.append("\n✅ Todos os arquivos esperados estão no banco.")
+            linhas.append("\n✅ Todos os ficheiros esperados estão no Redis.")
+
+        # Working memory actual
+        hist  = await asyncio.to_thread(get_historico_compactado, _DEBUG_SESSION)
+        sinais = await asyncio.to_thread(get_sinais, _DEBUG_SESSION)
+        linhas.append(f"\n### Working Memory\n- Turns: {hist.turns_incluidos} | Chars: {hist.total_chars}")
+        if sinais:
+            for k, v in sinais.items():
+                linhas.append(f"- {k}: `{v}`")
+
         await cl.Message(content="\n".join(linhas)).send()
 
+    # ── /fatos ────────────────────────────────────────────────────────────────
+    elif cmd == "/fatos":
+        if not _MODULOS_OK:
+            await cl.Message(content="⚠️ Módulos não carregados.").send()
+            return
+
+        fatos = await asyncio.to_thread(listar_todos_fatos, _DEBUG_USER)
+        if not fatos:
+            await cl.Message(content="ℹ️ Sem fatos long-term para o utilizador de debug.\nFaz algumas perguntas e usa `/extracao` para extrair.").send()
+        else:
+            linhas = [f"### Fatos Long-Term de `{_DEBUG_USER}` ({len(fatos)} total)\n"]
+            for i, f in enumerate(fatos, 1):
+                linhas.append(f"{i}. {f}")
+            await cl.Message(content="\n".join(linhas)).send()
+
+    # ── /extracao ─────────────────────────────────────────────────────────────
+    elif cmd == "/extracao":
+        if not _MODULOS_OK:
+            await cl.Message(content="⚠️ Módulos não carregados.").send()
+            return
+
+        async with cl.Step(name="🧠 Forçando extração de fatos") as step:
+            guardados = await asyncio.to_thread(forcar_extracao, _DEBUG_USER, _DEBUG_SESSION)
+            step.output = f"✅ {guardados} novos fatos guardados"
+
+        await cl.Message(content=f"🧠 Extração concluída: {guardados} novo(s) fato(s).\nUsa `/fatos` para ver.").send()
+
+    # ── /router <query> ───────────────────────────────────────────────────────
+    elif cmd == "/router":
+        query = " ".join(partes[1:]) if len(partes) > 1 else "matrícula veteranos"
+        if not _MODULOS_OK:
+            await cl.Message(content="⚠️ Módulos não carregados.").send()
+            return
+
+        async with cl.Step(name=f"🗺️ Testando router: '{query}'") as step:
+            resultado = await asyncio.to_thread(testar_roteamento, query)
+            step.output = str(resultado)
+
+        linhas = [f"### Resultado do Semantic Router\n\n**Query:** `{query}`\n"]
+        for r in resultado:
+            linhas.append(
+                f"- **{r.get('tool', '?')}** → rota=`{r.get('rota', '?')}` "
+                f"| score=`{r.get('score', 0):.3f}` "
+                f"| confiança=`{r.get('confianca', '?')}`"
+            )
+        await cl.Message(content="\n".join(linhas)).send()
+
+    # ── /modo ─────────────────────────────────────────────────────────────────
     elif cmd == "/modo":
         novo = partes[1] if len(partes) > 1 else ""
         if novo in ("agente", "direto"):
             s["modo"] = novo
             await cl.Message(content=f"✅ Modo: `{novo}`").send()
         else:
-            await cl.Message(content="❌ Use `/modo agente` ou `/modo direto`.").send()
+            await cl.Message(content="❌ Usa `/modo agente` ou `/modo direto`.").send()
 
+    # ── /ingerir ──────────────────────────────────────────────────────────────
     elif cmd == "/ingerir":
         if not _MODULOS_OK:
             await cl.Message(content="⚠️ Módulos não carregados.").send()
             return
-        async with cl.Step(name="📥 Re-ingerindo PDFs") as step:
+        async with cl.Step(name="📥 Re-ingerindo PDFs no Redis") as step:
             try:
                 await asyncio.to_thread(Ingestor().ingerir_tudo)
                 step.output = "✅ Concluído."
             except Exception as e:
                 step.output = f"❌ {e}"
-        await cl.Message(content="✅ Re-ingestão concluída. Use `/diagnostico` para confirmar.").send()
+        await cl.Message(content="✅ Re-ingestão concluída no Redis. Usa `/diagnostico` para confirmar.").send()
 
+    # ── /exportar ─────────────────────────────────────────────────────────────
     elif cmd == "/exportar":
         if not s["log"]:
-            await cl.Message(content="Nenhuma mensagem nesta sessão.").send()
+            await cl.Message(content="ℹ️ Nenhuma mensagem nesta sessão.").send()
             return
+
         linhas = [
-            f"# Log de Debug — Agente UEMA",
+            "# Log de Debug — Agente UEMA v3",
             f"# Gerado: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            f"# Modelo: {settings.GEMINI_MODEL if _MODULOS_OK else 'N/A'}",
             f"# Mensagens: {s['msgs']} · Tokens ~{s['tokens']}",
             "",
         ]
         for i, h in enumerate(s["log"], 1):
-            linhas += [f"─── [{i}] {h['ts']} | {h['modo']} | {h['latencia']}ms",
-                       f">>> {h['pergunta']}", f"<<< {h['resposta']}", ""]
+            linhas += [
+                f"─── [{i}] {h['ts']} | {h['modo']} | {h['latencia']}ms",
+                f">>> {h['pergunta']}",
+                f"<<< {h['resposta']}",
+                "",
+            ]
+
         await cl.Message(
-            content="📄 Log:",
+            content="📄 Log exportado:",
             elements=[cl.File(
-                name=f"debug_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                content="\n".join(linhas).encode("utf-8"), mime="text/plain",
+                name=f"debug_v3_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                content="\n".join(linhas).encode("utf-8"),
+                mime="text/plain",
             )]
         ).send()
+
     else:
-        await cl.Message(content=f"❓ Desconhecido: `{cmd}`. Use `/ajuda`.").send()
+        await cl.Message(content=f"❓ Comando desconhecido: `{cmd}`. Usa `/ajuda`.").send()

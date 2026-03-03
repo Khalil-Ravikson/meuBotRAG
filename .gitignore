@@ -10,10 +10,14 @@ pg-data/
 pg-data-v2/
 pg-data-v3/
 pg-data*/
-redis-data/
+<<<<<<< HEAD
+
+=======
+>>>>>>> featuresHome
 
 
 # Python e Ambiente Virtual
+.venv/
 venv/
 __pycache__/
 *.pyc

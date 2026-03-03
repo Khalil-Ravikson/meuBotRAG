@@ -1,148 +1,193 @@
 version: '3.8'
 
 # =============================================================================
-# COMO O .env FUNCIONA NESTE ARQUIVO
-# =============================================================================
-#
-# O Docker Compose lê o .env automaticamente — você não precisa fazer nada.
-# Ele serve para DUAS coisas diferentes ao mesmo tempo:
-#
-#  1) Interpolação no docker-compose.yml → ${VARIAVEL}
-#     Antes de subir os containers, o Compose substitui ${DB_USER} pelo valor
-#     que está no seu .env. Por isso DATABASE_URL pode ser montada dinamicamente.
-#
-#  2) Injeção dentro do container → env_file: .env
-#     O arquivo .env completo é passado para DENTRO do container como variáveis
-#     de ambiente. É isso que permite o settings.py ler GROQ_API_KEY etc.
-#
-# POR QUE ALGUMAS VARIÁVEIS APARECEM EM `environment:` E NÃO SÓ NO `env_file:`?
-#
-#   DATABASE_URL, REDIS_URL e EVOLUTION_BASE_URL usam NOMES DE SERVIÇO Docker
-#   (db, redis, evolution-api) como host — não "localhost".
-#   O .env do seu computador tem "localhost" (para dev local sem Docker).
-#   Por isso sobrescrevemos essas três aqui para o ambiente Docker correto.
-#
-# O env_file: passa tudo que restou (GROQ_API_KEY, HF_TOKEN, etc.)
+# docker-compose.yml — Bot UEMA v4.0 (Assíncrono com Celery)
 # =============================================================================
 
+networks:
+  uema:
+    driver: bridge
+    name: uema_network
+
 services:
+
   # ---------------------------------------------------------------------------
-  # 1. Evolution API v2 — Novo Motor do WhatsApp
+  # 1. Redis Stack
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis/redis-stack:latest
+    container_name: redis-stack
+    restart: unless-stopped
+    networks:
+      - uema
+    ports:
+      - "6379:6379"
+      - "8001:8001"
+    environment:
+      - TZ=America/Sao_Paulo
+    volumes:
+      - redis-data:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    command: >
+      redis-stack-server
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+      --save 60 1000
+      --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # 2. PostgreSQL — EXCLUSIVO da Evolution API
+  # ---------------------------------------------------------------------------
+  evolution-postgres:
+    image: postgres:16-alpine
+    container_name: evolution-postgres
+    restart: unless-stopped
+    networks:
+      - uema
+    environment:
+      - POSTGRES_DB=evolution
+      - POSTGRES_USER=evolution
+      - POSTGRES_PASSWORD=${EVOLUTION_DB_PASS:-evo_pass_2024}
+      - TZ=America/Sao_Paulo
+    volumes:
+      - evolution-pg-data:/var/lib/postgresql/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evolution -d evolution"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # 3. Evolution API v2
   # ---------------------------------------------------------------------------
   evolution-api:
-    image: atendai/evolution-api:v2.1.1
-    container_name: evolution_api
+    build:
+      context: https://github.com/EvolutionAPI/evolution-api.git#2.3.7
+      dockerfile: ./Dockerfile
+    image: evolution-api-local:2.3.7  
+    container_name: evolution-api
     restart: unless-stopped
+    networks:
+      - uema
     ports:
       - "8080:8080"
     environment:
       - SERVER_URL=http://localhost:8080
       - AUTHENTICATION_API_KEY=${EVOLUTION_API_KEY}
-      # 👇 Configurações de Banco de Dados (usando o seu pgvector)
+      - TZ=America/Sao_Paulo
+
+      # PostgreSQL
+      - DATABASE_ENABLED=true
       - DATABASE_PROVIDER=postgresql
-      - DATABASE_CONNECTION_URI=postgresql://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}?schema=evolution
+      - DATABASE_CONNECTION_URI=postgresql://evolution:${EVOLUTION_DB_PASS:-evo_pass_2024}@evolution-postgres:5432/evolution
       - DATABASE_CONNECTION_CLIENT_NAME=evolution_api
-      # 👇 Configurações de Cache (usando o seu Redis)
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=false
+      - DATABASE_SAVE_MESSAGE_UPDATE=false
+      - DATABASE_SAVE_DATA_CONTACTS=false
+      - DATABASE_SAVE_DATA_CHATS=false
+
+      # Cache Redis DB 1
       - CACHE_REDIS_ENABLED=true
       - CACHE_REDIS_URI=redis://redis:6379/1
       - CACHE_REDIS_PREFIX_KEY=evolution
-      # 👇 Webhook
-      - WEBHOOK_GLOBAL_URL=http://bot-rag:8000/webhook
+      - CACHE_REDIS_SAVE_INSTANCES=false
+
+      # Webhook
+      - WEBHOOK_GLOBAL_URL=http://bot:9000/webhook
       - WEBHOOK_GLOBAL_ENABLED=true
       - WEBHOOK_EVENTS_MESSAGES_UPSERT=true
+      - WEBHOOK_EVENTS_CONNECTION_UPDATE=true
       - CONFIG_SESSION_PHONE_VERSION=2.3000.1032691661
-      
+
     volumes:
       - ./evolution_instances:/evolution/instances
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      evolution-postgres:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/ || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 15s
+      start_period: 30s
 
   # ---------------------------------------------------------------------------
-  # 2. pgvector — Banco de dados vetorial (PostgreSQL + extensão pgvector)
-  # ---------------------------------------------------------------------------
-  db:
-    image: pgvector/pgvector:pg16
-    container_name: vectordb
-    restart: unless-stopped
-    environment:
-      - POSTGRES_USER=${DB_USER}
-      - POSTGRES_PASSWORD=${DB_PASS}
-      - POSTGRES_DB=${DB_NAME}
-    ports:
-      - "5433:5432"     # porta 5433 no host para não conflitar com Postgres local
-    volumes:
-      - ./pg-data-v3:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  # ---------------------------------------------------------------------------
-  # 3. Redis — Histórico de conversas + cache + deduplicação
-  # ---------------------------------------------------------------------------
-  redis:
-    image: redis:alpine
-    container_name: redis-cache
-    restart: unless-stopped
-    ports:
-      - "6379:6379"
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-
-  # ---------------------------------------------------------------------------
-  # 4. Bot RAG — A aplicação principal
+  # 4. Bot RAG (Rececionista Webhook)
   # ---------------------------------------------------------------------------
   bot:
     build: .
-    container_name: bot-rag
+    container_name: bot
     restart: unless-stopped
-
-    # `condition: service_healthy` significa que o bot só inicia depois que
-    # db e redis passarem no healthcheck — resolve o erro de conexão no startup
+    networks:
+      - uema
     depends_on:
-      db:
-        condition: service_healthy
       redis:
         condition: service_healthy
       evolution-api:
-        condition: service_started   # Agora espera a Evolution API iniciar
-
+        condition: service_started
     ports:
-      - "8000:8000"
-
+      - "9000:9000"
     volumes:
-      - ./dados:/app/dados           # PDFs para ingestão (sempre necessário)
-      - ./src:/app/src               # hot-reload em desenvolvimento
-      # Em produção: remova a linha acima e reconstrua a imagem com `docker-compose build`
-
-    # ── env_file: injeta o .env inteiro dentro do container ──────────────────
-    # O settings.py (pydantic-settings) lê as variáveis daqui.
-    # Tudo que não for sobrescrito em `environment:` vem do .env.
+      - ./dados:/app/dados
+      - ./src:/app/src
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     env_file:
       - .env
-
-    # ── environment: sobrescreve apenas o que muda no ambiente Docker ─────────
-    # Hosts são nomes de serviços Docker, não "localhost".
-    # Estas três linhas sobrescrevem o que veio do env_file acima.
     environment:
-      - DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
       - REDIS_URL=redis://redis:6379/0
-      # 👇 Atualizado para Evolution API
       - EVOLUTION_BASE_URL=http://evolution-api:8080
-      - WHATSAPP_HOOK_URL=http://bot-rag:8000/webhook
-
+      - WHATSAPP_HOOK_URL=http://bot:9000/webhook
+      - TZ=America/Sao_Paulo
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/health || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 3
-      start_period: 90s  # tempo para ingestão de PDFs no startup
+      retries: 5
+      start_period: 120s
+
+  # ---------------------------------------------------------------------------
+  # 5. Celery Worker (Processamento Pesado em Background V4)
+  # ---------------------------------------------------------------------------
+  celery-worker:
+    build: .
+    container_name: celery-worker
+    restart: unless-stopped
+    networks:
+      - uema
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./dados:/app/dados
+      - ./src:/app/src
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - EVOLUTION_BASE_URL=http://evolution-api:8080
+      - TZ=America/Sao_Paulo
+    command: celery -A src.infrastructure.celery_app.celery_app worker --loglevel=info --concurrency=2
+
+volumes:
+  redis-data:
+    driver: local
+  evolution-pg-data:
+    driver: local

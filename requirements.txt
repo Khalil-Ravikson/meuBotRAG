@@ -21,11 +21,14 @@ langchain-huggingface==0.0.3
 # --- Integrações & Drivers ---
 groq
 redis
+redis[hiredis]>=5.0
 llama-parse
 pymupdf
 sentence-transformers
 tiktoken
-
+google-genai==1.65.0
+celery[redis]>=5.3.6
+tenacity>=8.2.3
 # --- Banco de Dados ---
 psycopg[binary]
 sqlalchemy

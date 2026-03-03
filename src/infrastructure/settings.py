@@ -1,14 +1,16 @@
 """
-infrastructure/settings.py — Configurações centralizadas
-=========================================================
-Única fonte da verdade para variáveis de ambiente.
-
-Importe em qualquer lugar:
-    from src.infrastructure.settings import settings
+infrastructure/settings.py — Configurações centralizadas v3
+============================================================
+MIGRAÇÃO v2 → v3:
+  REMOVIDO:  GROQ_*, DATABASE_URL, DB_USER/PASS/NAME, WAHA_*, LLAMA_CLOUD_API_KEY
+             (o LlamaParse agora é opcional — só necessário se PDF_PARSER=llamaparse)
+  ADICIONADO: GEMINI_*, REDIS_URL (Redis Stack substitui pgvector),
+              PDF_PARSER (escolha do parser de PDF), LLAMA_CLOUD_API_KEY (opcional)
 """
+import os
 from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
-import os
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -18,56 +20,70 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── LLM (Groq) ────────────────────────────────────────────────────────────
-    GROQ_API_KEY:    str   = ""
-    GROQ_MODEL:      str   = "llama-3.1-8b-instant"
-    GROQ_TEMP:       float = 0.3
-    GROQ_MAX_TOKENS: int   = 1024
+    # ── Gemini (substitui Groq) ───────────────────────────────────────────────
+    GEMINI_API_KEY:    str   = ""
+    GEMINI_MODEL:      str   = "gemini-2.0-flash"
+    GEMINI_TEMP:       float = 0.3
+    GEMINI_MAX_TOKENS: int   = 1024
 
-    # ── HuggingFace ───────────────────────────────────────────────────────────
-    # HF_TOKEN acelera o DOWNLOAD do modelo (evita rate limit do Hub).
-    # Não afeta a velocidade de inferência (isso depende de CPU/GPU).
-    # Obtenha em: https://huggingface.co/settings/tokens
+    # ── HuggingFace (para BAAI/bge-m3) ───────────────────────────────────────
     HF_TOKEN: str = ""
 
-    # ── RAG / Ingestão ────────────────────────────────────────────────────────
+    # ── Parser de PDF ─────────────────────────────────────────────────────────
+    # Escolhe qual parser usar para extrair texto dos PDFs.
+    #
+    # "pymupdf"    → local, gratuito, rápido (~50ms/pág). Default.
+    #                Bom para PDFs semi-estruturados.
+    #                Requer: pip install pymupdf
+    #
+    # "llamaparse" → cloud, pago (~$0.003/pág), melhor para tabelas complexas.
+    #                Requer: pip install llama-parse  +  LLAMA_CLOUD_API_KEY abaixo
+    #
+    # Podes também forçar por ficheiro individual no PDF_CONFIG (ingestion.py):
+    #   "edital_paes_2026.pdf": { ..., "parser": "llamaparse" }
+    PDF_PARSER: str = "pymupdf"
+
+    # ── LlamaParse (só necessário se PDF_PARSER=llamaparse) ───────────────────
+    # Obtém em: https://cloud.llamaindex.ai
     LLAMA_CLOUD_API_KEY: str = ""
-    DATA_DIR:            str = "/app/dados"
 
-    # ── Banco vetorial (pgvector) ─────────────────────────────────────────────
-    DATABASE_URL: str = "postgresql://postgres:postgres@localhost:5432/vectordb"
+    # ── RAG ───────────────────────────────────────────────────────────────────
+    DATA_DIR: str = "/app/dados"
 
-    # ── Redis ─────────────────────────────────────────────────────────────────
+    # ── Redis Stack ───────────────────────────────────────────────────────────
+    # Substitui pgvector + redis:alpine da v2.
+    # DB 0 → bot (chunks, memória, vectores)
+    # DB 1 → Evolution API (cache de sessões)
     REDIS_URL: str = "redis://localhost:6379/0"
 
-    # ── WAHA (DESCONTINUADO) ───────────────────────────────────────────────────────
-    # WAHA_API_KEY:      str = ""
-    # WAHA_BASE_URL:     str = "http://waha:3000"
-    # WAHA_SESSION:      str = "default"
-    # WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
-
-    # ── EVOLUTION (WhatsApp) ───────────────────────────────────────────────────────
-    EVOLUTION_BASE_URL: str
-    EVOLUTION_API_KEY: str
+    # ── Evolution API (WhatsApp) ──────────────────────────────────────────────
+    EVOLUTION_BASE_URL:      str = "http://localhost:8080"
+    EVOLUTION_API_KEY:       str = ""
     EVOLUTION_INSTANCE_NAME: str = "default"
-    WHATSAPP_HOOK_URL: str = "http://bot-rag:8000/webhook"
+    WHATSAPP_HOOK_URL:       str = "http://bot:9000/webhook"
+
     # ── Agente ────────────────────────────────────────────────────────────────
     AGENT_MAX_ITERATIONS: int = 6
     AGENT_TIMEOUT_S:      int = 45
     MAX_HISTORY_MESSAGES: int = 8
 
-    # ── LangSmith (observabilidade LangChain) ─────────────────────────────────
-    # Rastreia chamadas do agente, tokens, tools, latência no dashboard.
-    # Obtenha em: https://smith.langchain.com → Settings → API Keys
-    # Quando vazio, o LangSmith fica desativado automaticamente.
+    # ── Semantic Router ───────────────────────────────────────────────────────
+    # Limiar de similaridade para o routing semântico.
+    # 0.0 = sempre usa a tool mais próxima (mesmo que pouco similar)
+    # 0.5 = só usa tool se a similaridade for >= 50% (mais conservador)
+    ROUTER_SIMILARITY_THRESHOLD: float = 0.35
+
+    # ── LangSmith (opcional) ──────────────────────────────────────────────────
     LANGCHAIN_API_KEY:    str  = ""
-    LANGCHAIN_PROJECT:    str  = "uema-bot"
-    LANGCHAIN_TRACING_V2: bool = False   # True ativa o rastreamento
+    LANGCHAIN_PROJECT:    str  = "uema-bot-v3"
+    LANGCHAIN_TRACING_V2: bool = False
 
     # ── Dev / Debug ───────────────────────────────────────────────────────────
     DEV_MODE:      bool = False
     DEV_WHITELIST: str  = ""
     LOG_LEVEL:     str  = "INFO"
+
+    # ── Propriedades derivadas ────────────────────────────────────────────────
 
     @property
     def dev_whitelist_list(self) -> list[str]:
@@ -78,6 +94,11 @@ class Settings(BaseSettings):
     @property
     def langsmith_ativo(self) -> bool:
         return bool(self.LANGCHAIN_API_KEY and self.LANGCHAIN_TRACING_V2)
+
+    @property
+    def llamaparse_disponivel(self) -> bool:
+        """True se o LlamaParse está configurado e pronto a usar."""
+        return bool(self.LLAMA_CLOUD_API_KEY) and self.PDF_PARSER.lower() == "llamaparse"
 
 
 @lru_cache(maxsize=1)

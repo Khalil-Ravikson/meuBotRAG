@@ -1,130 +1,111 @@
 """
-agent/prompts.py — Prompts do agente (única fonte da verdade)
+agent/prompts.py — Fonte Única de Verdade para Prompts do LLM
 =============================================================
-Todos os system prompts e templates de contextualização ficam aqui.
-Nenhum outro arquivo deve ter strings de prompt.
+
+Este ficheiro centraliza todas as instruções, templates e regras
+de negócio passadas ao Gemini. 
+
+USO DE XML TAGS (Google Gemini Cookbook):
+  O Google recomenda vivamente o uso de tags XML (ex: <contexto>...</contexto>)
+  em vez de parênteses retos para separar claramente instruções de dados,
+  reduzindo drasticamente as alucinações em tarefas de RAG.
 """
-from src.domain.entities import Rota
 
-# =============================================================================
-# System prompt do agente
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 1. SYSTEM PROMPT PRINCIPAL
+# Define a "persona" do bot e as regras inquebráveis.
+# -----------------------------------------------------------------------------
+SYSTEM_UEMA = """Você é o Assistente Virtual da UEMA (Universidade Estadual do Maranhão), Campus Paulo VI.
+Responda sempre em português brasileiro, de forma objetiva, acolhedora e precisa.
 
-SYSTEM_PROMPT = """Você é o Assistente Virtual da UEMA (Universidade Estadual do Maranhão), \
-Campus Paulo VI, São Luís - MA.
-Responda sempre em português brasileiro, de forma objetiva e precisa.
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FERRAMENTAS DISPONÍVEIS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-📅 consultar_calendario_academico
-   Para: datas do calendário letivo 2026 (matrícula, prova, feriado, semestre, trancamento)
-   Query: "matricula veteranos 2026.1" | "feriados marco" | "inicio aulas"
-
-📋 consultar_edital_paes_2026
-   Para: processo seletivo PAES 2026 (vagas, cotas, inscrição, documentos, cronograma)
-   Query: "vagas engenharia civil" | "documentos inscricao" | "cotas BR-PPI"
-
-📞 consultar_contatos_uema
-   Para: e-mails, telefones, responsáveis de setores da UEMA
-   Query: "PROG pro-reitoria email" | "CTIC TI contato" | "CECEN diretor"
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REGRAS
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-1. Use APENAS o retorno das ferramentas. NUNCA invente datas, vagas ou contatos.
-2. Se a ferramenta retornar "Não encontrei": tente UMA query diferente.
-   Se ainda não encontrar: informe que a informação não está disponível e sugira uema.br.
-3. Se retornar "ERRO TÉCNICO": diga "Tive uma instabilidade. Tente em instantes." e PARE.
-4. Máximo de 2 tentativas por ferramenta. Depois, responda com o que encontrou.
-5. Respostas curtas: até 3 parágrafos ou 6 itens em lista.
-6. Use *negrito* para datas, e-mails e setores importantes."""
+REGRAS ESTritas:
+1. Use APENAS as informações fornecidas na tag <informacao_documentos>.
+2. NUNCA invente datas, vagas, nomes ou contatos.
+3. Se a informação solicitada não estiver no contexto fornecido, diga educadamente que não tem essa informação e sugira consultar o site oficial (uema.br) ou a secretaria.
+4. Mantenha as respostas curtas: máximo de 3 parágrafos ou uma lista de até 6 itens.
+5. Use formatação Markdown (*negrito* para datas, prazos e termos cruciais)."""
 
 
-# =============================================================================
-# Contextos de rota (injetados no prompt antes da mensagem do usuário)
-# =============================================================================
-
-_CONTEXTOS: dict[Rota, str] = {
-    Rota.CALENDARIO: (
-        "O usuário tem uma dúvida sobre datas ou eventos do calendário acadêmico da UEMA 2026. "
-        "Use EXCLUSIVAMENTE a ferramenta 'consultar_calendario_academico'. "
-        "Passe palavras-chave específicas como query (ex: 'matricula veteranos 2026.1'). "
-        "Nunca invente datas — use apenas o que a ferramenta retornar."
-    ),
-    Rota.EDITAL: (
-        "O usuário tem uma dúvida sobre o Edital do PAES 2026 (processo seletivo da UEMA). "
-        "Use EXCLUSIVAMENTE a ferramenta 'consultar_edital_paes_2026'. "
-        "Passe termos específicos como query. "
-        "Nunca invente regras ou números de vagas."
-    ),
-    Rota.CONTATOS: (
-        "O usuário quer encontrar um contato, e-mail ou telefone da UEMA. "
-        "Use EXCLUSIVAMENTE a ferramenta 'consultar_contatos_uema'. "
-        "Passe o nome do setor ou cargo como query. "
-        "Nunca invente e-mails ou telefones."
-    ),
-    Rota.GERAL: (
-        "Assunto não identificado claramente. Responda com o que souber "
-        "ou oriente o usuário a usar o menu principal para escolher uma área."
-    ),
-}
-
-
-def montar_prompt_enriquecido(
-    texto_usuario: str,
-    rota: Rota,
-    contexto_usuario: dict | None = None,
+# -----------------------------------------------------------------------------
+# 2. TEMPLATE DE RAG E MEMÓRIA
+# Junta as peças do puzzle (Fatos, Conversa, Busca Vetorial e a Pergunta)
+# -----------------------------------------------------------------------------
+def montar_prompt_geracao(
+    pergunta: str,
+    contexto_rag: str,
+    working_memory: dict | None = None,
+    fatos_usuario: list[str] | None = None,
 ) -> str:
     """
-    Monta o prompt completo que vai para o agente LLM.
-    Combina: contexto da rota + dados do usuário + mensagem original.
+    Monta o prompt final enviado ao LLM, encapsulando os dados em tags XML
+    para que o Gemini distinga perfeitamente o que é instrução e o que é dado.
     """
-    linhas = [
-        "[CONTEXTO DO ATENDIMENTO]",
-        f"Área: {rota.value}",
-        f"Instrução: {_CONTEXTOS[rota]}",
-    ]
+    blocos: list[str] = []
 
-    if contexto_usuario:
-        if nome := contexto_usuario.get("nome"):
-            linhas.append(f"Nome do usuário: {nome}")
-        if curso := contexto_usuario.get("curso"):
-            linhas.append(f"Curso: {curso}")
-        if ultima := contexto_usuario.get("ultima_intencao"):
-            linhas.append(f"Última área consultada: {ultima}")
+    # 1. Memória de longo prazo (Factos do Utilizador)
+    if fatos_usuario:
+        fatos_str = "\n".join(f"- {f}" for f in fatos_usuario[:5]) 
+        blocos.append(f"<perfil_aluno>\n{fatos_str}\n</perfil_aluno>")
 
-    linhas += ["", "[MENSAGEM DO USUÁRIO]", texto_usuario]
-    return "\n".join(linhas)
+    # 2. Memória de curto prazo (Contexto da sessão atual)
+    if working_memory:
+        mem_parts = []
+        if topico := working_memory.get("ultimo_topico"):
+            mem_parts.append(f"Último assunto falado: {topico}")
+        if tool := working_memory.get("tool_usada"):
+            mem_parts.append(f"Área consultada recentemente: {tool}")
+        if mem_parts:
+            blocos.append(f"<contexto_conversa>\n" + "\n".join(mem_parts) + "\n</contexto_conversa>")
+
+    # 3. Contexto Base (os ficheiros PDF injetados pelo Retrieval/Pgvector/Redis)
+    if contexto_rag:
+        blocos.append(f"<informacao_documentos>\n{contexto_rag}\n</informacao_documentos>")
+    else:
+        blocos.append("<informacao_documentos>\nNenhuma informação específica foi encontrada nos documentos para esta pergunta.\n</informacao_documentos>")
+
+    # 4. A Pergunta Final em si
+    blocos.append(f"<pergunta_aluno>\n{pergunta}\n</pergunta_aluno>")
+
+    return "\n\n".join(blocos)
 
 
-# =============================================================================
-# Mensagens de erro amigáveis (única fonte da verdade)
-# =============================================================================
+# -----------------------------------------------------------------------------
+# 3. PROMPTS PARA STRUCTURED OUTPUTS (Geração de JSON Nativo)
+# Não precisam de pedir "Devolva APENAS JSON" porque o Pydantic já o força,
+# mas precisam de exemplos claros (Few-Shot Prompting).
+# -----------------------------------------------------------------------------
+PROMPT_QUERY_REWRITE = """Você é um especialista em reescrever perguntas de alunos para otimizar a busca em bases de dados documentais académicas (RAG).
 
-MSG_RATE_LIMIT = (
-    "O sistema está com alta demanda no momento. "
-    "Aguarde alguns segundos e tente novamente. 🙏"
-)
+Sua Tarefa: 
+Analise a pergunta original do aluno e reescreva-a expandindo termos implícitos, jargões ou abreviações. O objetivo é criar a query perfeita para encontrar o parágrafo certo num Edital ou Calendário.
 
-MSG_NAO_ENCONTRADO = (
-    "Não consegui encontrar essa informação no momento. "
-    "Tente reformular sua pergunta ou acesse uema.br diretamente."
-)
+Fatos conhecidos sobre o aluno (use para dar contexto se necessário):
+<fatos>
+{fatos}
+</fatos>
 
-MSG_ERRO_TECNICO = (
-    "Desculpe, tive uma dificuldade técnica. Tente novamente."
-)
+Pergunta original do aluno: <pergunta>{pergunta}</pergunta>
 
-MSG_HISTORICO_RESETADO = (
-    "Desculpe, tive uma instabilidade. Seu histórico foi reiniciado. Pode repetir a pergunta?"
-)
+Siga os exemplos abaixo para compreender a estrutura esperada:
+- "quando é minha prova?" → query_reescrita="datas provas avaliações finais 2026", palavras_chave=["prova", "avaliação", "data"]
+- "como me inscrevo?" → query_reescrita="procedimento inscrição PAES 2026 documentos necessários", palavras_chave=["inscrição", "PAES", "documentos"]
+"""
 
-# Strings internas do LangChain que NÃO devem ser enviadas ao usuário
-OUTPUTS_INVALIDOS = frozenset({
-    "agent stopped due to max iterations.",
-    "agent stopped due to iteration limit or time limit.",
-    "parsing error",
-})
+
+PROMPT_EXTRACAO_FATOS = """Você é um analista de dados cujo trabalho é extrair factos permanentes e objetivos sobre os alunos a partir das suas conversas de WhatsApp.
+
+Analise a conversa abaixo:
+<conversa>
+{conversa}
+</conversa>
+
+Sua Tarefa:
+Extraia APENAS factos verificáveis e de longo prazo. Ignore desabafos, cumprimentos ou dúvidas temporárias resolvidas.
+
+Exemplos de factos válidos para extrair:
+- "Aluno do curso de Engenharia Civil"
+- "Inscrito no PAES 2026 na categoria BR-PPI"
+- "É um aluno veterano (matrícula 2026.1)"
+
+Se não houver nenhum facto claro e permanente na conversa, devolva a lista vazia.
+"""
