@@ -63,10 +63,11 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-
+from pydantic import BaseModel
 from src.memory.long_term_memory import Fato, fatos_como_string
 from src.providers.gemini_provider import (
     PROMPT_QUERY_REWRITE,
+    QueryRewriteSchema,
     chamar_gemini_estruturado,
 )
 
@@ -124,6 +125,12 @@ class QueryTransformada:
     def query_para_log(self) -> str:
         arrow = " → " if self.foi_transformada else " (sem transform)"
         return f"'{self.query_original[:40]}'{arrow}'{self.query_principal[:60]}'"
+
+class SubQuerySchema(BaseModel):
+     query_principal: str
+     sub_queries: list[str]
+     palavras_chave: list[str]
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -216,16 +223,22 @@ def transformar_para_step_back(pergunta: str) -> str:
 def _transformar_query_simples(pergunta: str, fatos_str: str) -> QueryTransformada:
     """
     Transformação simples: reescreve a query com termos técnicos.
-    Usa o prompt PROMPT_QUERY_REWRITE do gemini_provider.
+
+    CORRIGIDO: usa response_schema=QueryRewriteSchema (Pydantic) em vez
+    de schema_descricao (string). A API garante a estrutura do JSON,
+    eliminando falhas de parse silenciosas.
     """
+    from src.providers.gemini_provider import QueryRewriteSchema, chamar_gemini_estruturado, PROMPT_QUERY_REWRITE
+
     prompt = PROMPT_QUERY_REWRITE.format(
-        fatos=fatos_str,
+        fatos=fatos_str or "Nenhum fato disponível.",
         pergunta=pergunta,
     )
 
+    # CORRIGIDO: response_schema nativo em vez de schema_descricao string
     resultado = chamar_gemini_estruturado(
         prompt=prompt,
-        schema_descricao='{"query_reescrita": "string", "palavras_chave": ["string"]}',
+        response_schema=QueryRewriteSchema,   # ← Structured Output nativo
         temperatura=0.1,
     )
 
@@ -235,22 +248,26 @@ def _transformar_query_simples(pergunta: str, fatos_str: str) -> QueryTransforma
             query_original=pergunta,
             query_principal=pergunta,
             foi_transformada=False,
-            motivo="gemini falhou",
+            motivo="gemini_falhou",
         )
 
     query_reescrita = resultado.get("query_reescrita", "").strip()
     palavras_chave  = resultado.get("palavras_chave", [])
 
-    # Valida: query reescrita deve ser mais rica que a original
+    # Guarda de segurança: query reescrita não pode ser mais curta que 50% da original
+    # (indica que o modelo truncou ou devolveu algo inválido)
     if not query_reescrita or len(query_reescrita) < len(pergunta) * 0.5:
+        logger.debug(
+            "⚠️  Query reescrita muito curta (%d < %d chars), usando original",
+            len(query_reescrita), len(pergunta),
+        )
         query_reescrita = pergunta
 
-    # Trunca se muito longa
     query_reescrita = query_reescrita[:_MAX_QUERY_CHARS]
 
     logger.info(
-        "🔄 Query transform: '%s' → '%s'",
-        pergunta[:40], query_reescrita[:60],
+        "🔄 Query rewrite: '%.40s' → '%.60s'",
+        pergunta, query_reescrita,
     )
 
     return QueryTransformada(
@@ -258,59 +275,71 @@ def _transformar_query_simples(pergunta: str, fatos_str: str) -> QueryTransforma
         query_principal=query_reescrita,
         palavras_chave=palavras_chave,
         foi_transformada=True,
-        motivo="gemini rewrite",
+        motivo="gemini_rewrite",
     )
-
 
 def _transformar_com_sub_queries(pergunta: str, fatos_str: str) -> QueryTransformada:
     """
     Sub-Query Decomposition para perguntas complexas com múltiplas intenções.
+
+    CORRIGIDO: usa response_schema Pydantic em vez de schema_descricao string.
+    Define SubQuerySchema inline para não criar dependência circular.
     """
-    _PROMPT_SUB = """Decompõe a pergunta complexa abaixo em sub-perguntas simples.
+    from pydantic import BaseModel
+    from src.providers.gemini_provider import chamar_gemini_estruturado
 
-Fatos do aluno:
-{fatos}
+    class SubQuerySchema(BaseModel):
+        query_principal: str
+        sub_queries: list[str]
+        palavras_chave: list[str]
 
-Pergunta: {pergunta}
+    _PROMPT_SUB = (
+        "Decompõe a pergunta complexa abaixo em sub-perguntas simples.\n\n"
+        "Fatos do aluno:\n<fatos>{fatos}</fatos>\n\n"
+        "Pergunta: <pergunta>{pergunta}</pergunta>\n\n"
+        "Cria 2-3 sub-perguntas técnicas que juntas respondem à pergunta original.\n"
+        "query_principal deve ser uma versão abrangente da pergunta original."
+    )
 
-Cria 2-3 sub-perguntas técnicas que juntas respondem à pergunta original.
-Responda APENAS com JSON:
-{{"query_principal": "query abrangente",
-  "sub_queries": ["sub-query 1", "sub-query 2", "sub-query 3"],
-  "palavras_chave": ["termo1", "termo2"]}}
-"""
+    prompt = _PROMPT_SUB.format(fatos=fatos_str or "Nenhum fato.", pergunta=pergunta)
 
-    prompt = _PROMPT_SUB.format(fatos=fatos_str, pergunta=pergunta)
-
+    # CORRIGIDO: response_schema nativo
     resultado = chamar_gemini_estruturado(
         prompt=prompt,
-        schema_descricao='{"query_principal": "str", "sub_queries": ["str"], "palavras_chave": ["str"]}',
+        response_schema=SubQuerySchema,
         temperatura=0.1,
     )
 
     if not resultado:
-        # Fallback para transformação simples
+        # Fallback gracioso para transformação simples
+        logger.debug("⚠️  Sub-query decomposition falhou → fallback para rewrite simples")
         return _transformar_query_simples(pergunta, fatos_str)
 
     query_principal = resultado.get("query_principal", pergunta).strip()[:_MAX_QUERY_CHARS]
-    sub_queries = [q.strip()[:_MAX_QUERY_CHARS] for q in resultado.get("sub_queries", []) if q.strip()]
+    sub_queries = [
+        q.strip()[:_MAX_QUERY_CHARS]
+        for q in resultado.get("sub_queries", [])
+        if q.strip() and len(q.strip()) > 5   # filtra sub-queries triviais
+    ]
     palavras_chave = resultado.get("palavras_chave", [])
 
+    # Garante pelo menos 1 sub-query
+    if not sub_queries:
+        return _transformar_query_simples(pergunta, fatos_str)
+
     logger.info(
-        "🔄 Sub-queries: '%s' → principal='%s' + %d sub-queries",
-        pergunta[:40], query_principal[:50], len(sub_queries),
+        "🔄 Sub-queries: '%.40s' → principal='%.50s' + %d subs",
+        pergunta, query_principal, len(sub_queries),
     )
 
     return QueryTransformada(
         query_original=pergunta,
         query_principal=query_principal,
-        sub_queries=sub_queries[:3],   # Máximo 3 sub-queries
+        sub_queries=sub_queries[:3],
         palavras_chave=palavras_chave,
         foi_transformada=True,
-        motivo="sub-query decomposition",
+        motivo="sub_query_decomposition",
     )
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # Heurísticas de decisão
 # ─────────────────────────────────────────────────────────────────────────────

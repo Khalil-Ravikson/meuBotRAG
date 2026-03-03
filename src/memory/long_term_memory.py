@@ -111,30 +111,23 @@ class Fato:
 # Guardar fatos
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def guardar_fato(user_id: str, texto_fato: str) -> bool:
     """
-    Converte um facto em vetor e guarda no Redis (duas estruturas).
+    Converte um fato em vetor e guarda no Redis (duas estruturas).
 
-    FLUXO:
-      1. Normaliza o texto (lowercase, strip)
-      2. Verifica se fato já existe (por hash) → evita duplicados
-      3. Computa embedding do fato (BAAI/bge-m3, CPU local)
-      4. Guarda JSON com embedding no Redis (mem:facts:vec:...)
-      5. Guarda texto na lista ordenada (mem:facts:list:...)
-      6. Aplica ltrim para não ultrapassar _MAX_FATOS_USER
+    CORRECÇÕES APLICADAS:
+      1. Importação: from src.rag.embeddings import get_embeddings
+         (em vez de src.rag.vector_store que foi eliminado com o pgvector)
 
-    POR QUE GUARDAR O EMBEDDING DO FATO?
-      Quando o aluno pergunta algo, buscamos quais fatos são
-      SEMANTICAMENTE RELEVANTES para aquela pergunta específica.
+      2. Cliente Redis: get_redis_text() para r.json().set()
+         (em vez de get_redis() com bytes — o RedisJSON lida melhor com
+         strings quando o cliente tem decode_responses=True)
 
-      Exemplo:
-        Pergunta: "quando é o início das aulas?"
-        Fatos do aluno: [
-          "Aluno de Engenharia Civil" → similaridade: 0.45 (baixa)
-          "Dúvida sobre início do 2026.1" → similaridade: 0.89 (alta!) ✓
-          "Inscrito via BR-PPI" → similaridade: 0.32 (baixa)
-        ]
-        → Apenas o fato relevante entra no contexto
+      3. Separação de clientes:
+         - r_text (decode_responses=True) → operações JSON e de lista
+         - r_bin  (decode_responses=False) → apenas para verificar existência
+           de chave com r_bin.exists() (retorna int, compatível com ambos)
 
     Retorna True se guardado com sucesso, False se já existia ou erro.
     """
@@ -144,47 +137,55 @@ def guardar_fato(user_id: str, texto_fato: str) -> bool:
 
     fato = Fato(texto=texto_normalizado, user_id=user_id)
 
-    r       = get_redis()
-    r_text  = get_redis_text()
+    # CORRIGIDO: dois clientes com responsabilidades claras
+    r_text = get_redis_text()   # Para JSON set/get e operações de lista
+    r_bin  = get_redis()        # Para exists() — compatível com ambos os modos
 
     # ── Verifica duplicado ───────────────────────────────────────────────────
     key_vec = f"{_PREFIX_FATOS_VEC}{user_id}:{fato.hash_id}"
-    if r.exists(key_vec):
+    if r_bin.exists(key_vec):
         logger.debug("ℹ️  Fato já existe [%s]: %.60s", user_id, texto_normalizado)
         return False
 
     # ── Computa embedding ────────────────────────────────────────────────────
+    # CORRIGIDO: from src.rag.embeddings (não src.rag.vector_store)
+    vetor: list[float] = []
     try:
-        from src.rag.vector_store import get_embeddings
+        from src.rag.embeddings import get_embeddings   # ← CORRETO
         embeddings_model = get_embeddings()
         vetor = embeddings_model.embed_query(texto_normalizado)
     except Exception as e:
-        logger.error("❌ Falha ao computar embedding do fato [%s]: %s", user_id, e)
-        # Guarda sem embedding (ainda útil para Quick Recall)
-        vetor = []
+        logger.error(
+            "❌ Falha ao computar embedding do fato [%s]: %s. "
+            "Guardando sem vetor (Quick Recall apenas).",
+            user_id, e,
+        )
+        # Guarda sem embedding — fato ainda útil para buscar_fatos_recentes()
+        # mas não aparecerá em buscar_fatos_relevantes() (sem vetor para comparar)
 
-    # ── Guarda JSON + embedding no Redis ─────────────────────────────────────
+    # ── Guarda JSON + embedding no Redis (CORRIGIDO: r_text) ─────────────────
     doc = {
         "texto":     texto_normalizado,
         "user_id":   user_id,
         "timestamp": fato.timestamp,
-        "embedding": vetor,
+        "embedding": vetor,          # lista[float] → JSON array nativo
     }
     try:
-        r.json().set(key_vec, "$", doc)
-        r.expire(key_vec, _TTL_FATOS)
+        r_text.json().set(key_vec, "$", doc)     # ← CORRIGIDO: r_text
+        r_text.expire(key_vec, _TTL_FATOS)       # ← CORRIGIDO: r_text
     except Exception as e:
-        logger.error("❌ Falha ao guardar vetor do fato: %s", e)
+        logger.error("❌ Falha ao guardar vetor do fato [%s]: %s", user_id, e)
         return False
 
-    # ── Guarda na lista (para Quick Recall) ──────────────────────────────────
+    # ── Guarda na lista de Quick Recall ──────────────────────────────────────
     key_list = f"{_PREFIX_FATOS_LIST}{user_id}"
     try:
         r_text.lpush(key_list, texto_normalizado)
         r_text.ltrim(key_list, 0, _MAX_FATOS_USER - 1)
         r_text.expire(key_list, _TTL_FATOS)
     except Exception as e:
-        logger.warning("⚠️  Falha ao guardar fato na lista: %s", e)
+        logger.warning("⚠️  Falha ao guardar fato na lista [%s]: %s", user_id, e)
+        # Não é fatal — o vetor já foi guardado, Quick Recall apenas fica sem atualizar
 
     logger.info("💾 Fato guardado [%s]: %.80s", user_id, texto_normalizado)
     return True

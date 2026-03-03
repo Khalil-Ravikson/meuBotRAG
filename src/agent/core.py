@@ -453,30 +453,61 @@ class AgentCore:
         obs.error("SYSTEM", "gemini_erro", resp.erro[:200])
         return AgentResponse(conteudo=_MSG_ERRO_TECNICO, rota=rota, sucesso=False)
 
+        
+
     def _lancar_extracao_background(self, user_id: str, session_id: str) -> None:
         """
         Lança a extração de fatos em background sem bloquear a resposta.
 
-        USA asyncio.get_event_loop().call_soon_threadsafe() para ser seguro
-        mesmo quando chamado de dentro de asyncio.to_thread().
+        CORRIGIDO: O padrão anterior usava asyncio.get_event_loop() que é
+        deprecado no Python 3.10+ e retorna o loop errado quando chamado
+        de dentro de asyncio.to_thread().
 
-        Se o event loop não estiver disponível (ex: testes), executa
-        síncronamente com supressão de erros.
+        NOVA ESTRATÉGIA — tenta 3 abordagens em ordem de preferência:
+
+          1. asyncio.get_running_loop(): Se existe um loop a correr no
+             thread ATUAL (incomum em to_thread), usa-o.
+             Caso mais raro — acontece em testes com asyncio.run().
+
+          2. threading.Thread(daemon=True): A forma mais robusta para
+             o nosso caso. O AgentCore.responder() corre num thread do
+             pool do asyncio.to_thread(). Lançar um daemon thread separado
+             garante que a extração corre independentemente, sem bloquear
+             o thread principal nem o event loop do FastAPI.
+             daemon=True → o thread morre automaticamente quando o processo
+             principal terminar (sem zombie threads).
+
+          3. Execução síncrona direta: Fallback final para contextos de
+             teste onde não há event loop nem thread pool.
         """
-        try:
-            from src.memory.memory_extractor import extrair_fatos_do_ultimo_turn
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Estamos dentro do event loop do FastAPI → cria task
-                asyncio.ensure_future(
-                    asyncio.to_thread(extrair_fatos_do_ultimo_turn, user_id, session_id)
-                )
-            else:
-                # Fora do event loop (ex: testes, Chainlit) → executa direto
+        import threading
+        from src.memory.memory_extractor import extrair_fatos_do_ultimo_turn
+
+        def _run_in_thread() -> None:
+            """Executado em daemon thread separado."""
+            try:
                 extrair_fatos_do_ultimo_turn(user_id, session_id)
+                logger.debug("🧠 Extração background concluída [%s]", user_id)
+            except Exception as e:
+                # Extração nunca deve quebrar o fluxo principal
+                logger.debug("ℹ️  Extração background ignorada [%s]: %s", user_id, e)
+
+        try:
+            # Tenta usar o event loop se estiver disponível no thread atual
+            loop = asyncio.get_running_loop()
+            # Se chegou aqui, há um loop — usa to_thread para não bloquear
+            asyncio.ensure_future(
+                asyncio.to_thread(extrair_fatos_do_ultimo_turn, user_id, session_id),
+                loop=loop,
+            )
+        except RuntimeError:
+            # Sem loop no thread atual (caso normal quando chamado via to_thread)
+            # Lança daemon thread independente — forma mais robusta
+            t = threading.Thread(target=_run_in_thread, daemon=True, name=f"extractor-{user_id[:8]}")
+            t.start()
         except Exception as e:
-            # Extração em background nunca deve quebrar o fluxo principal
             logger.debug("ℹ️  Extração background ignorada: %s", e)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

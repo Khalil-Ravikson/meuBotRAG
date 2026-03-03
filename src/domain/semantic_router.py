@@ -125,29 +125,28 @@ def registar_tools(tools: list) -> None:
     """
     Regista as tools no Redis com os seus embeddings.
 
-    Chamado no startup após inicializar_indices().
-    Cada tool precisa ter um .name e .description (LangChain tools têm isso).
+    CORRIGIDO: Usamos get_redis_text() em vez de get_redis() para as
+    operações JSON. O cliente com decode_responses=False (bytes) pode
+    causar inconsistências ao ler campos de string como 'name' e
+    'description' via r.json().get() — o RedisJSON devolve bytes que
+    depois não são comparáveis com strings Python.
 
-    COMO O EMBEDDING É GERADO:
-      Usamos o mesmo modelo BAAI/bge-m3 da ingestão (já carregado em memória).
-      O texto embedado combina nome + descrição para máxima expressividade.
+    O embedding (lista de floats) é serializado como JSON nativo pelo
+    RedisJSON em ambos os modos, mas a leitura posterior dos campos de
+    texto é mais fiável com decode_responses=True.
 
-      Exemplo para tool_calendario:
-        Texto: "consultar_calendario_academico Consulta datas, prazos e eventos
-                do calendário acadêmico da UEMA 2026. Use para: Matrícula,
-                rematrícula, início e fim de semestres, feriados, provas..."
-        → Vetor de 1024 dimensões no espaço semântico
-
-    POR QUE NÃO USAR EMBEDDINGS ESTÁTICOS?
-      Poderíamos hardcodar os vetores, mas registar dinamicamente permite:
-      - Adicionar novas tools sem re-treinar nada
-      - Actualizar descrições das tools sem restart completo
-      - Testar diferentes formulações de descrição facilmente
+    NOTA: O índice IDX_TOOLS foi criado com o cliente de bytes em
+    criar_indice_tools(), o que está correto — a criação de índice não
+    lê dados. Apenas a escrita/leitura de documentos JSON beneficia
+    do cliente de texto.
     """
-    from src.rag.embeddings import get_embeddings   # Import local para evitar circular
+    from src.rag.embeddings import get_embeddings
+    from src.infrastructure.redis_client import get_redis_text, PREFIX_TOOLS
 
     embeddings_model = get_embeddings()
-    r = get_redis()
+
+    # CORRIGIDO: get_redis_text() para operações de leitura/escrita JSON
+    r = get_redis_text()
 
     registadas = 0
     for tool in tools:
@@ -162,25 +161,29 @@ def registar_tools(tools: list) -> None:
         texto_embedding = f"{name}: {desc}"
 
         try:
-            # Computa embedding (CPU, ~20ms por tool)
-            vetor = embeddings_model.embed_query(texto_embedding)
+            # Computa embedding (CPU local, ~20ms por tool, modelo já em memória)
+            vetor: list[float] = embeddings_model.embed_query(texto_embedding)
 
-            # Armazena no Redis como JSON
             key = f"{PREFIX_TOOLS}{name}"
+
+            # Armazena no Redis como RedisJSON
+            # O RedisJSON aceita listas Python nativas como arrays JSON
             r.json().set(key, "$", {
                 "name":        name,
                 "description": desc,
-                "embedding":   vetor,
+                "embedding":   vetor,   # lista[float] → JSON array
             })
+
             registadas += 1
-            logger.debug("📌 Tool registada: %s (dim=%d)", name, len(vetor))
+            logger.debug("📌 Tool registada: '%s' (embedding dim=%d)", name, len(vetor))
 
         except Exception as e:
             logger.error("❌ Falha ao registar tool '%s': %s", name, e)
 
-    logger.info("✅ %d/%d tools registadas no Redis para semantic routing.", registadas, len(tools))
-
-
+    logger.info(
+        "✅ %d/%d tools registadas no Redis para semantic routing.",
+        registadas, len(tools),
+    )
 # ─────────────────────────────────────────────────────────────────────────────
 # Roteamento
 # ─────────────────────────────────────────────────────────────────────────────

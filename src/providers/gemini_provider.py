@@ -1,14 +1,29 @@
 """
-providers/gemini_provider.py — Provedor Gemini Flash 2.0 com Tenacity (V4)
-========================================================================================
+providers/gemini_provider.py — Gemini Flash com Tenacity Resiliente (V4 — Corrigido)
+======================================================================================
 
-ATUALIZAÇÃO COOKBOOK:
-───────────────────
-  - Structured Outputs: Usa Pydantic e `response_schema` nativo para garantir JSON perfeito,
-    eliminando a necessidade de funções complexas de regex.
-  - Prompting XML: Substitui `[BLOCOS]` por `<tags_xml>` conforme recomendado pela Google
-    para melhorar o RAG e evitar alucinações.
-  - Mantém o Tenacity e o backoff exponencial para resiliência.
+BUGS CORRIGIDOS vs versão anterior:
+─────────────────────────────────────
+  BUG 1 (CRÍTICO — TypeError silencioso): chamar_gemini_estruturado() aceitava
+    `schema_descricao: str` em query_transform.py, mas a assinatura esperava
+    `response_schema: type[BaseModel]`. Resultado: query transform sempre caía
+    no fallback sem lançar erro visível.
+    CORRIGIDO: chamar_gemini_estruturado() aceita AMBOS os formatos:
+      - response_schema (Pydantic) → usa Structured Output nativo da API
+      - schema_descricao (str)     → injeta no prompt como instrução JSON
+    Mantém compatibilidade com query_transform.py SEM obrigar refactor imediato.
+
+  BUG 2 (CRÍTICO — Retry cego): @retry sem retry_if_exception fazia retry
+    em QUALQUER exceção, incluindo INVALID_ARGUMENT, API_KEY_INVALID, etc.
+    Desperdiçava tentativas e mascarava bugs reais de configuração.
+    CORRIGIDO: retry_if_exception(_is_retryable) filtra apenas 429/503/timeout.
+
+  BUG 3 (Menor — Duplicação): SYSTEM_UEMA e montar_prompt_geracao estavam
+    duplicados em gemini_provider.py e agent/prompts.py.
+    CORRIGIDO: gemini_provider.py importa de agent/prompts.py.
+    agent/prompts.py é a fonte única de verdade dos prompts.
+    (Mantemos re-export de SYSTEM_UEMA e montar_prompt_geracao aqui para
+    não quebrar o import em agent/core.py.)
 """
 from __future__ import annotations
 
@@ -21,145 +36,225 @@ from typing import Any
 
 import google.genai as genai
 from google.genai import types
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from tenacity import (
     retry,
+    retry_if_exception,
     stop_after_attempt,
     wait_exponential,
-    before_sleep_log
+    before_sleep_log,
 )
 
 from src.infrastructure.settings import settings
 
+# Importa prompts de agent/prompts.py — FONTE ÚNICA DE VERDADE
+# Re-exportamos aqui para manter compatibilidade com imports existentes em core.py
+from src.agent.prompts import (
+    SYSTEM_UEMA,
+    montar_prompt_geracao,
+    PROMPT_QUERY_REWRITE,
+    PROMPT_EXTRACAO_FATOS,
+)
+
+__all__ = [
+    "SYSTEM_UEMA",
+    "montar_prompt_geracao",
+    "PROMPT_QUERY_REWRITE",
+    "PROMPT_EXTRACAO_FATOS",
+    "GeminiResponse",
+    "get_gemini_client",
+    "chamar_gemini",
+    "chamar_gemini_async",
+    "chamar_gemini_estruturado",
+    "QueryRewriteSchema",
+    "ExtracaoFatosSchema",
+]
+
 logger = logging.getLogger(__name__)
 
-MODELO_PRIMARIO  = "gemini-2.0-flash"
-MODELO_FALLBACK  = "gemini-1.5-flash"
+# Modelos disponíveis (fallback automático se o primário saturar)
+MODELO_PRIMARIO = "gemini-2.5-flash"
+MODELO_FALLBACK = "gemini-2.0-flash-lite"
 
 
-# -------------------------------------------------------------------------
-# SCHEMAS PYDANTIC (Cookbook: Structured Outputs)
-# O Gemini garante devolver o JSON exatamente com esta estrutura.
-# -------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Schemas Pydantic para Structured Outputs nativos
+# ─────────────────────────────────────────────────────────────────────────────
+
 class QueryRewriteSchema(BaseModel):
-    query_reescrita: str = Field(description="A pergunta reescrita com termos técnicos para busca documental")
-    palavras_chave: list[str] = Field(description="Lista de palavras-chave extraídas da pergunta")
+    query_reescrita: str
+    palavras_chave: list[str]
 
 class ExtracaoFatosSchema(BaseModel):
-    fatos: list[str] = Field(description="Lista de factos objetivos extraídos sobre o aluno. Vazia se não houver.")
+    fatos: list[str]
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Response normalizado
+# ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class GeminiResponse:
-    """Resposta normalizada do Gemini."""
-    conteudo:    str
-    model:       str
-    input_tokens:  int = 0
-    output_tokens: int = 0
-    sucesso:     bool = True
-    erro:        str = ""
+    conteudo:      str
+    model:         str
+    input_tokens:  int  = 0
+    output_tokens: int  = 0
+    sucesso:       bool = True
+    erro:          str  = ""
 
     @property
     def tokens_total(self) -> int:
         return self.input_tokens + self.output_tokens
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Cliente singleton
+# ─────────────────────────────────────────────────────────────────────────────
+
 @lru_cache(maxsize=1)
 def get_gemini_client() -> genai.Client:
-    """Retorna cliente Gemini singleton."""
     api_key = settings.GEMINI_API_KEY
     if not api_key:
-        raise RuntimeError("GEMINI_API_KEY não configurada.")
+        raise RuntimeError("GEMINI_API_KEY não configurada no .env")
     client = genai.Client(api_key=api_key)
     logger.info("✅ Cliente Gemini inicializado | modelo=%s", MODELO_PRIMARIO)
     return client
 
 
-# -------------------------------------------------------------------------
-# CONFIGURAÇÃO DO TENACITY (Resiliência)
-# -------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Filtro de erros retriáveis — CORRIGIDO
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_retryable(exc: BaseException) -> bool:
+    """
+    Decide se o Tenacity deve fazer retry neste erro.
+
+    RETRIÁVEIS (problemas temporários de infra/quota):
+      - 429 Too Many Requests (Rate Limit)
+      - 503 Service Unavailable (modelo sobrecarregado)
+      - Timeout de rede (conexão interrompida)
+
+    NÃO RETRIÁVEIS (bugs de código ou configuração):
+      - 400 INVALID_ARGUMENT  → prompt malformado, schema errado
+      - 401 / 403             → API key inválida ou sem permissão
+      - 404                   → modelo não existe
+      - Qualquer outro erro   → não adianta tentar de novo
+
+    Por que isto importa?
+      Sem este filtro, o Tenacity faz 4 tentativas num INVALID_ARGUMENT,
+      gastando 30s+ e mascarando o bug real. Com o filtro, falha na 1ª
+      tentativa e o erro aparece imediatamente nos logs.
+    """
+    err = str(exc).lower()
+    return (
+        "429"         in err or
+        "quota"       in err or
+        "rate limit"  in err or
+        "503"         in err or
+        "overloaded"  in err or
+        "timeout"     in err or
+        "connection"  in err
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chamada core com Tenacity — CORRIGIDO
+# ─────────────────────────────────────────────────────────────────────────────
+
 @retry(
+    # Filtra: só faz retry em erros temporários (429, 503, timeout)
+    retry=retry_if_exception(_is_retryable),
+
+    # Backoff exponencial: 2s → 4s → 8s → 16s (4 tentativas = ~30s total)
+    # Adequado para o Free Tier do Gemini que tem janelas de 1 minuto
+    wait=wait_exponential(multiplier=2, min=2, max=16),
+
+    # Para depois de 4 tentativas. Se o rate limit persistir, o Celery
+    # fará retry da task inteira (com backoff maior)
     stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=2, min=2, max=10),
-    before_sleep=before_sleep_log(logger, logging.WARNING)
+
+    # Loga cada tentativa para diagnóstico
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+
+    # IMPORTANTE: reraise=True → após esgotar tentativas, lança a exceção
+    # original para que chamar_gemini() possa tratar o fallback
+    reraise=True,
 )
 def _chamar_gemini_com_retry(
     prompt: str,
-    system_instruction: str | None = None,
-    temperatura: float | None = None,
-    max_tokens: int | None = None,
-    modelo: str | None = None,
-    response_schema: type[BaseModel] | None = None,
+    system_instruction: str | None,
+    temperatura: float,
+    max_tokens: int,
+    modelo: str,
+    response_schema: type[BaseModel] | None,
 ) -> GeminiResponse:
     """
-    Função interna síncrona protegida por retry inteligente.
-    Agora aceita `response_schema` para saídas JSON estruturadas.
+    Chamada síncrona ao Gemini protegida por retry inteligente.
+    Não chamar diretamente — usar chamar_gemini() como interface pública.
     """
     client = get_gemini_client()
-    modelo_alvo = modelo or MODELO_PRIMARIO
-    temp = temperatura if temperatura is not None else settings.GEMINI_TEMP
-    max_tok = max_tokens or settings.GEMINI_MAX_TOKENS
 
-    # Constrói os parâmetros do GenerateContentConfig dinamicamente
     config_kwargs: dict[str, Any] = {
-        "temperature": temp,
-        "max_output_tokens": max_tok,
+        "temperature":      temperatura,
+        "max_output_tokens": max_tokens,
         "safety_settings": [
-            types.SafetySetting(category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_ONLY_HIGH"),
-            types.SafetySetting(category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_ONLY_HIGH"),
-            types.SafetySetting(category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_ONLY_HIGH"),
-            types.SafetySetting(category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_ONLY_HIGH"),
+            types.SafetySetting(
+                category="HARM_CATEGORY_HARASSMENT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_HATE_SPEECH",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
+            types.SafetySetting(
+                category="HARM_CATEGORY_SEXUALLY_EXPLICIT",
+                threshold="BLOCK_ONLY_HIGH",
+            ),
         ],
     }
 
     if system_instruction:
         config_kwargs["system_instruction"] = system_instruction
 
-    # Integração Nativa de Structured Outputs (JSON sem regex!)
-    if response_schema:
+    # Structured Output nativo (quando fornecido schema Pydantic)
+    if response_schema is not None:
         config_kwargs["response_mime_type"] = "application/json"
-        config_kwargs["response_schema"] = response_schema
+        config_kwargs["response_schema"]    = response_schema
 
     config = types.GenerateContentConfig(**config_kwargs)
 
-    try:
-        resposta = client.models.generate_content(
-            model=modelo_alvo,
-            contents=prompt,
-            config=config,
-        )
+    resposta = client.models.generate_content(
+        model=modelo,
+        contents=prompt,
+        config=config,
+    )
 
-        usage = getattr(resposta, "usage_metadata", None)
-        input_tok  = getattr(usage, "prompt_token_count", 0) if usage else 0
-        output_tok = getattr(usage, "candidates_token_count", 0) if usage else 0
+    usage      = getattr(resposta, "usage_metadata", None)
+    input_tok  = getattr(usage, "prompt_token_count",      0) if usage else 0
+    output_tok = getattr(usage, "candidates_token_count",  0) if usage else 0
+    conteudo   = resposta.text or ""
 
-        conteudo = resposta.text or ""
+    logger.debug(
+        "✅ Gemini | modelo=%s | in=%d | out=%d | chars=%d",
+        modelo, input_tok, output_tok, len(conteudo),
+    )
 
-        logger.debug(
-            "✅ Gemini | modelo=%s | in=%d | out=%d",
-            modelo_alvo, input_tok, output_tok,
-        )
+    return GeminiResponse(
+        conteudo=conteudo,
+        model=modelo,
+        input_tokens=input_tok,
+        output_tokens=output_tok,
+        sucesso=True,
+    )
 
-        return GeminiResponse(
-            conteudo=conteudo,
-            model=modelo_alvo,
-            input_tokens=input_tok,
-            output_tokens=output_tok,
-            sucesso=True,
-        )
 
-    except Exception as e:
-        err_str = str(e).lower()
-        is_rate_limit = "429" in err_str or "quota" in err_str or "rate limit" in err_str
-        is_overloaded  = "503" in err_str or "overloaded" in err_str
-
-        if is_rate_limit or is_overloaded:
-            logger.warning("⏳ Rate Limit do Gemini atingido. O Tenacity vai gerir o backoff...")
-            raise 
-
-        logger.error("❌ Erro fatal Gemini: %s", e)
-        return GeminiResponse(conteudo="", model=modelo_alvo, sucesso=False, erro=str(e))
-
+# ─────────────────────────────────────────────────────────────────────────────
+# Interface pública síncrona
+# ─────────────────────────────────────────────────────────────────────────────
 
 def chamar_gemini(
     prompt: str,
@@ -169,28 +264,48 @@ def chamar_gemini(
     modelo: str | None = None,
     response_schema: type[BaseModel] | None = None,
 ) -> GeminiResponse:
-    """Envolve a chamada protegida pelo Tenacity com try/except final para fallback."""
+    """
+    Interface pública síncrona. Tenta o modelo primário com Tenacity;
+    se esgotar, faz fallback automático para o modelo secundário.
+    Nunca lança exceção — sempre retorna GeminiResponse.
+    """
+    modelo_alvo = modelo or MODELO_PRIMARIO
+    temp        = temperatura if temperatura is not None else settings.GEMINI_TEMP
+    max_tok     = max_tokens or settings.GEMINI_MAX_TOKENS
+
     try:
         return _chamar_gemini_com_retry(
-            prompt, system_instruction, temperatura, max_tokens, modelo, response_schema
+            prompt, system_instruction, temp, max_tok, modelo_alvo, response_schema,
         )
     except Exception as e:
-        if (modelo or MODELO_PRIMARIO) == MODELO_PRIMARIO:
-            logger.warning("🔄 Tenacity esgotado para %s. A tentar fallback para %s...", MODELO_PRIMARIO, MODELO_FALLBACK)
+        # Tenacity esgotado → tenta fallback se estava no modelo primário
+        if modelo_alvo == MODELO_PRIMARIO:
+            logger.warning(
+                "🔄 Tenacity esgotado para %s → tentando fallback %s",
+                MODELO_PRIMARIO, MODELO_FALLBACK,
+            )
             try:
                 return _chamar_gemini_com_retry(
-                    prompt, system_instruction, temperatura, max_tokens, MODELO_FALLBACK, response_schema
+                    prompt, system_instruction, temp, max_tok,
+                    MODELO_FALLBACK, response_schema,
                 )
             except Exception as e_fallback:
-                logger.error("❌ Fallback também falhou: %s", e_fallback)
-                
+                logger.error("❌ Fallback %s também falhou: %s", MODELO_FALLBACK, e_fallback)
+                erro_msg = str(e_fallback)
+        else:
+            erro_msg = str(e)
+
         return GeminiResponse(
-            conteudo="", 
-            model=MODELO_PRIMARIO, 
-            sucesso=False, 
-            erro="Max retries esgotados em todos os modelos"
+            conteudo="",
+            model=modelo_alvo,
+            sucesso=False,
+            erro=erro_msg[:300],
         )
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Interface pública assíncrona (para uso em contextos async)
+# ─────────────────────────────────────────────────────────────────────────────
 
 async def chamar_gemini_async(
     prompt: str,
@@ -199,6 +314,7 @@ async def chamar_gemini_async(
     max_tokens: int | None = None,
     response_schema: type[BaseModel] | None = None,
 ) -> GeminiResponse:
+    """Wrapper assíncrono: executa chamar_gemini() em thread pool."""
     return await asyncio.to_thread(
         chamar_gemini,
         prompt=prompt,
@@ -209,107 +325,79 @@ async def chamar_gemini_async(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Structured Output — CORRIGIDO (aceita str ou BaseModel)
+# ─────────────────────────────────────────────────────────────────────────────
+
 def chamar_gemini_estruturado(
     prompt: str,
-    response_schema: type[BaseModel],
+    response_schema: type[BaseModel] | None = None,
+    schema_descricao: str | None = None,
     system_instruction: str | None = None,
     temperatura: float = 0.1,
 ) -> dict | None:
     """
-    Nova Versão (Cookbook): Usa o response_schema nativo do Gemini.
-    O modelo devolve sempre um JSON limpo e exato. Sem Regex!
+    Chama o Gemini esperando um JSON estruturado como resposta.
+
+    CORRIGIDO: aceita dois modos de schema para compatibilidade total:
+
+    Modo 1 — Pydantic (preferido, usa Structured Output nativo da API):
+      chamar_gemini_estruturado(prompt, response_schema=QueryRewriteSchema)
+      → API garante JSON perfeito, sem regex. Nunca falha o parse.
+
+    Modo 2 — String (compatibilidade com query_transform.py existente):
+      chamar_gemini_estruturado(prompt, schema_descricao='{"query_reescrita": "str"}')
+      → Injeta a descrição do schema no prompt como instrução.
+      → O modelo tenta seguir, mas pode falhar o parse (menos robusto).
+      → Boa prática: migrar gradualmente para Modo 1.
+
+    Retorna o dict parseado, ou None em caso de falha.
     """
-    resposta = chamar_gemini(
-        prompt=prompt,
-        system_instruction=system_instruction,
-        temperatura=temperatura,
-        max_tokens=512,
-        response_schema=response_schema
-    )
+    prompt_final = prompt
+
+    if response_schema is not None:
+        # Modo 1: deixa a API garantir o formato (mais robusto)
+        resposta = chamar_gemini(
+            prompt=prompt_final,
+            system_instruction=system_instruction,
+            temperatura=temperatura,
+            max_tokens=512,
+            response_schema=response_schema,
+        )
+    elif schema_descricao is not None:
+        # Modo 2: injeta instruções de formato no prompt
+        instrucao = (
+            f"\n\nResponda APENAS com um objeto JSON válido, sem markdown, "
+            f"sem explicações, seguindo exatamente esta estrutura:\n{schema_descricao}"
+        )
+        prompt_final = prompt + instrucao
+        resposta = chamar_gemini(
+            prompt=prompt_final,
+            system_instruction=system_instruction,
+            temperatura=temperatura,
+            max_tokens=512,
+            response_schema=None,  # Sem schema nativo → depende do prompt
+        )
+    else:
+        logger.error("chamar_gemini_estruturado: forneça response_schema ou schema_descricao")
+        return None
 
     if not resposta.sucesso or not resposta.conteudo:
         return None
 
+    # Parse JSON — limpa possíveis marcadores de markdown residuais
+    texto = resposta.conteudo.strip()
+    if texto.startswith("```"):
+        texto = texto.split("```")[1]
+        if texto.startswith("json"):
+            texto = texto[4:]
+        texto = texto.strip()
+
     try:
-        # A resposta é garantidamente um JSON string limpo graças à API
-        return json.loads(resposta.conteudo)
-    except json.JSONDecodeError:
-        logger.error("❌ Falha crítica: Gemini quebrou o Structured Output: %s", resposta.conteudo)
+        return json.loads(texto)
+    except json.JSONDecodeError as e:
+        logger.error(
+            "❌ JSON parse falhou: %s | conteúdo: %.100s",
+            e, resposta.conteudo,
+        )
         return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompts Especializados (Cookbook: XML Tags)
-# ─────────────────────────────────────────────────────────────────────────────
-
-SYSTEM_UEMA = """Você é o Assistente Virtual da UEMA (Universidade Estadual do Maranhão), Campus Paulo VI.
-Responda sempre em português brasileiro, de forma objetiva e precisa.
-Use APENAS as informações fornecidas no contexto — NUNCA invente datas, vagas ou contatos.
-Se a informação não estiver no contexto, diga que não está disponível e sugira consultar uema.br.
-Respostas curtas: máximo 3 parágrafos ou 6 itens. Use *negrito* para datas e termos importantes."""
-
-
-def montar_prompt_geracao(
-    pergunta: str,
-    contexto_rag: str,
-    working_memory: dict | None = None,
-    fatos_usuario: list[str] | None = None,
-) -> str:
-    """
-    Monta o prompt usando XML Tags, como recomendado no Google Gemini Cookbook.
-    As tags XML ajudam o modelo a separar perfeitamente as instruções dos dados.
-    """
-    blocos: list[str] = []
-
-    if fatos_usuario:
-        fatos_str = "\n".join(f"- {f}" for f in fatos_usuario[:5]) 
-        blocos.append(f"<perfil_aluno>\n{fatos_str}\n</perfil_aluno>")
-
-    if working_memory:
-        mem_parts = []
-        if topico := working_memory.get("ultimo_topico"):
-            mem_parts.append(f"Último assunto: {topico}")
-        if tool := working_memory.get("tool_usada"):
-            mem_parts.append(f"Área consultada: {tool}")
-        if mem_parts:
-            blocos.append(f"<contexto_conversa>\n" + "\n".join(mem_parts) + "\n</contexto_conversa>")
-
-    if contexto_rag:
-        blocos.append(f"<informacao_documentos>\n{contexto_rag}\n</informacao_documentos>")
-    else:
-        blocos.append("<informacao_documentos>\nNenhuma informação específica encontrada para esta pergunta.\n</informacao_documentos>")
-
-    blocos.append(f"<pergunta_aluno>\n{pergunta}\n</pergunta_aluno>")
-
-    return "\n\n".join(blocos)
-
-
-PROMPT_QUERY_REWRITE = """Você reescreve perguntas de alunos para melhorar a busca em documentos académicos.
-
-Tarefa: Reescreva a pergunta para incluir termos técnicos relevantes.
-
-Fatos do aluno (use se relevante):
-<fatos>
-{fatos}
-</fatos>
-
-Pergunta original: <pergunta>{pergunta}</pergunta>
-
-Siga os exemplos abaixo para perceber a estrutura esperada:
-- "quando é minha prova?" → query_reescrita="datas provas avaliações finais 2026", palavras_chave=["prova", "avaliação", "data"]
-- "como me inscrevo?" → query_reescrita="procedimento inscrição PAES 2026 documentos necessários", palavras_chave=["inscrição", "PAES", "documentos"]
-"""
-
-
-PROMPT_EXTRACAO_FATOS = """Analise a conversa abaixo e extraia factos objetivos sobre o aluno.
-
-<conversa>
-{conversa}
-</conversa>
-
-Extraia APENAS factos verificáveis (não suposições).
-Exemplos de factos válidos:
-- "Aluno do curso de Engenharia Civil"
-- "Inscrito no PAES 2026 categoria BR-PPI"
-- "Dúvida sobre matrícula veteranos 2026.1"
-"""
