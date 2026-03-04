@@ -1,4 +1,4 @@
-version: '3.8'
+
 
 # =============================================================================
 # docker-compose.yml — Bot UEMA v4.0 (Assíncrono com Celery)
@@ -72,7 +72,7 @@ services:
   # ---------------------------------------------------------------------------
   evolution-api:
     build:
-      context: https://github.com/EvolutionAPI/evolution-api.git#2.3.7
+      context: https://github.com/EvolutionAPI/evolution-api.git#2.3.7 
       dockerfile: ./Dockerfile
     image: evolution-api-local:2.3.7  
     container_name: evolution-api

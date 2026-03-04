@@ -1,38 +1,45 @@
 """
-rag/ingestion.py — Ingestor v3.1 (dual-parser: pymupdf ou LlamaParse)
-=======================================================================
+rag/ingestion.py — Ingestor v3.2
+==================================
 
-DOIS PARSERS DISPONÍVEIS — escolhe no .env:
+BUGS CORRIGIDOS NESTA VERSÃO (v3.1 → v3.2):
 ─────────────────────────────────────────────
-  PDF_PARSER=pymupdf      ← local, gratuito, rápido (~50ms/página)
-                             bom para PDFs simples e semi-estruturados
-  PDF_PARSER=llamaparse   ← cloud, pago por página (~$0.003/pág)
-                             melhor para tabelas complexas e layouts difíceis
 
-  O default é pymupdf. Para activar o LlamaParse:
-    1. Adiciona ao .env:
-         PDF_PARSER=llamaparse
-         LLAMA_CLOUD_API_KEY=llx-...
-    2. Adiciona ao requirements.txt:
-         llama-parse
-    3. Faz docker-compose restart bot
+BUG 1 (CRÍTICO — Dupla ingestão simultânea):
+  Sintoma no log:
+    ForkPoolWorker-1: ⚠️  Manifesto diz ok mas Redis perdeu 3 ficheiro(s)
+    ForkPoolWorker-2: ⚠️  Manifesto diz ok mas Redis perdeu 3 ficheiro(s)
+    → ambos iniciam LlamaParse para os mesmos PDFs simultaneamente.
 
-COMO FUNCIONA A SELECÇÃO:
-─────────────────────────
-  No startup, _parsear_pdf() lê settings.PDF_PARSER e despacha para
-  _parsear_com_pymupdf() ou _parsear_com_llamaparse().
-  Os TXTs são sempre lidos directamente (sem parser externo).
+  Causa raiz:
+    _verificar_redis_vs_manifesto() não tinha proteção contra chamadas concorrentes.
+    Worker-1 e Worker-2 chegavam ao mesmo tempo, ambos viam Redis vazio,
+    ambos entravam na re-ingestão ANTES de qualquer lock ser adquirido.
 
-  Podes também configurar por ficheiro individual no PDF_CONFIG,
-  adicionando a chave "parser": "llamaparse" só nos PDFs complexos.
-  Se "parser" não estiver definido no config, usa o default do settings.
+  Solução (dois níveis de proteção):
+    1. Lock distribuído Redis ("lock:ingestao:verificar:{nome}") por ficheiro:
+       Garante que apenas UM processo (de qualquer container) re-ingere cada PDF.
+    2. Verificação dupla (double-check) dentro do lock:
+       Após adquirir o lock, re-verifica se o ficheiro já está no Redis.
+       O segundo worker, ao adquirir o lock, encontra o ficheiro já ingerido → skip.
 
-O RESTO NÃO MUDOU:
-──────────────────
-  - Chunking Hierárquico com prefixo anti-alucinação
-  - Verificação por ficheiro (só ingere os novos)
-  - Embeddings BAAI/bge-m3 locais (CPU)
-  - Persistência no Redis Stack
+  Custo do lock por ficheiro vs. lock global:
+    Lock global → Worker-2 espera Worker-1 terminar TODOS os PDFs (5-10 min).
+    Lock por ficheiro → Worker-2 espera só o PDF que está sendo ingerido pelo
+    Worker-1 naquele momento. Se Worker-1 está no calendário e Worker-2 precisa
+    do edital, eles podem ingerir em paralelo ficheiros diferentes.
+
+BUG 2 (MENOR — parsing_instruction deprecated):
+  Sintoma no log:
+    WARNING: parsing_instruction is deprecated. Use system_prompt, system_prompt_append
+    or user_prompt instead.
+
+  Causa: LlamaParse v0.3+ renomeou o parâmetro.
+
+  Solução: _parsear_com_llamaparse() agora usa system_prompt.
+    A lógica é idêntica — só o nome do parâmetro mudou.
+    Retrocompatibilidade: PDF_CONFIG ainda aceita "parsing_instruction" como chave,
+    mas internamente é passado como system_prompt para o LlamaParse.
 """
 from __future__ import annotations
 
@@ -48,6 +55,7 @@ from typing import Iterator
 from src.infrastructure.redis_client import (
     PREFIX_CHUNKS,
     get_redis,
+    get_redis_text,
     salvar_chunk,
 )
 from src.infrastructure.settings import settings
@@ -55,36 +63,53 @@ from src.infrastructure.settings import settings
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Configuração por ficheiro
-# A chave "parser" é opcional — substitui o PDF_PARSER do settings por ficheiro
+# PDF_CONFIG
 # ─────────────────────────────────────────────────────────────────────────────
 
 PDF_CONFIG: dict[str, dict] = {
-    # ── PDFs ──────────────────────────────────────────────────────────────────
     "calendario-academico-2026.pdf": {
         "doc_type":   "calendario",
         "titulo":     "Calendário Acadêmico UEMA 2026",
-        "chunk_size": 350,
-        "overlap":    60,
+        "chunk_size": 280,
+        "overlap":    80,
         "label":      "CALENDÁRIO ACADÊMICO UEMA 2026",
-        # "parser": "llamaparse",  # descomenta para forçar LlamaParse neste ficheiro
+        # Usado como system_prompt no LlamaParse (parsing_instruction foi depreciado)
+        "parsing_instruction": (
+            "Este PDF é o Calendário Acadêmico da UEMA 2026. "
+            "Para CADA linha de evento na tabela, formate exatamente assim:\n"
+            "EVENTO: [nome do evento] | DATA: [data ou período completo] | SEM: [semestre]\n"
+            "Exemplo: EVENTO: Matrícula de veteranos | DATA: 03/02/2026 a 07/02/2026 | SEM: 2026.1\n"
+            "IMPORTANTE: Mantenha TODOS os eventos. Cada linha da tabela = uma linha EVENTO:."
+        ),
     },
     "edital_paes_2026.pdf": {
         "doc_type":   "edital",
         "titulo":     "Edital PAES 2026 — Processo Seletivo UEMA",
-        "chunk_size": 550,
+        "chunk_size": 500,
         "overlap":    80,
         "label":      "EDITAL PAES 2026",
-        # "parser": "llamaparse",  # descomenta se as tabelas de vagas ficarem mal
+        "parsing_instruction": (
+            "Este PDF é o Edital do PAES 2026 da UEMA. "
+            "Para tabelas de vagas, preserve:\n"
+            "CURSO: [nome] | TURNO: [turno] | AC: [nº] | PcD: [nº] | TOTAL: [nº]\n"
+            "Para cotas:\n"
+            "CATEGORIA: [sigla] | NOME: [nome completo] | PÚBLICO: [descrição]\n"
+            "Preserve todos os números de vagas e numeração dos itens."
+        ),
     },
     "guia_contatos_2025.pdf": {
         "doc_type":   "contatos",
         "titulo":     "Guia de Contatos UEMA 2025",
-        "chunk_size": 280,
+        "chunk_size": 250,
         "overlap":    30,
         "label":      "CONTATOS UEMA 2025",
+        "parsing_instruction": (
+            "Este PDF é o Guia de Contatos da UEMA 2025. "
+            "Para cada contato:\n"
+            "CARGO: [cargo] | NOME: [nome completo] | EMAIL: [email] | TEL: [telefone]\n"
+            "Mantenha o nome do centro/unidade como cabeçalho de cada bloco."
+        ),
     },
-    # ── TXTs (sempre lidos directamente — parser ignorado) ────────────────────
     "contatos_saoluis.txt": {
         "doc_type":   "contatos",
         "titulo":     "Contatos São Luís — UEMA",
@@ -101,28 +126,10 @@ PDF_CONFIG: dict[str, dict] = {
     },
 }
 
-# Valores válidos para PDF_PARSER
 _PARSERS_VALIDOS = {"pymupdf", "llamaparse"}
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Manifesto de ingestão (ficheiro em disco — independente do Redis)
-#
-# Problema que resolve:
-#   _sources_no_redis() depende do Redis ter o índice FT criado.
-#   No startup, o Redis pode estar a iniciar e o índice ainda não existe.
-#   Resultado: devolve set() vazio → re-ingere tudo desnecessariamente.
-#
-# Solução:
-#   Guardamos um ficheiro JSON em DATA_DIR/.ingest_manifest.json com:
-#     { "calendario-academico-2026.pdf": { "hash": "abc123", "chunks": 45 }, ... }
-#   O hash é do conteúdo do ficheiro — se o PDF mudar, o hash muda e re-ingere.
-#   Se o Redis perder dados mas o ficheiro existir, o manifesto protege.
-#
-# Ciclo de vida:
-#   1. Startup → lê manifesto → compara com ficheiros em disco
-#   2. Se hash igual → skip (mesmo que Redis esteja vazio temporariamente)
-#   3. Após ingestão bem-sucedida → actualiza manifesto
-#   4. Para forçar re-ingestão: apaga DATA_DIR/.ingest_manifest.json
+# Manifesto
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _caminho_manifesto() -> str:
@@ -130,7 +137,6 @@ def _caminho_manifesto() -> str:
 
 
 def _ler_manifesto() -> dict:
-    """Lê o manifesto de disco. Devolve {} se não existir ou estiver corrompido."""
     path = _caminho_manifesto()
     try:
         if os.path.exists(path):
@@ -142,27 +148,24 @@ def _ler_manifesto() -> dict:
 
 
 def _guardar_manifesto(manifesto: dict) -> None:
-    """Guarda o manifesto em disco atomicamente."""
     path = _caminho_manifesto()
     tmp  = path + ".tmp"
     try:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(manifesto, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, path)  # atómico — nunca fica ficheiro meio-escrito
-        logger.debug("💾 Manifesto actualizado: %s", path)
+        os.replace(tmp, path)
     except Exception as e:
         logger.warning("⚠️  Falha ao guardar manifesto: %s", e)
 
 
 def _hash_ficheiro(caminho: str) -> str:
-    """SHA-256 dos primeiros 64KB do ficheiro (rápido, detecta mudanças)."""
     h = hashlib.sha256()
     try:
         with open(caminho, "rb") as f:
             h.update(f.read(65536))
     except Exception:
         pass
-    return h.hexdigest()[:16]  # 16 chars são suficientes para detectar mudanças
+    return h.hexdigest()[:16]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +174,6 @@ def _hash_ficheiro(caminho: str) -> str:
 
 @dataclass
 class ChunkBruto:
-    """Chunk de texto antes de gerar o embedding."""
     texto_puro:  str
     texto_final: str
     source:      str
@@ -185,29 +187,17 @@ class ChunkBruto:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Ingestor:
-    """
-    Ingestor com suporte a dois parsers de PDF.
-    Interface pública idêntica ao ingestor.py original.
-    """
 
     def __init__(self):
         from src.rag.embeddings import get_embeddings
         self._embeddings = get_embeddings()
 
-        # Valida e loga o parser activo no startup
         parser = settings.PDF_PARSER.lower()
         if parser not in _PARSERS_VALIDOS:
-            logger.warning(
-                "⚠️  PDF_PARSER='%s' inválido. A usar 'pymupdf'. "
-                "Valores válidos: %s",
-                parser, _PARSERS_VALIDOS,
-            )
+            logger.warning("⚠️  PDF_PARSER='%s' inválido. A usar 'pymupdf'.", parser)
         elif parser == "llamaparse":
             if not settings.LLAMA_CLOUD_API_KEY:
-                logger.error(
-                    "❌ PDF_PARSER=llamaparse mas LLAMA_CLOUD_API_KEY não está definida no .env! "
-                    "A fazer fallback para pymupdf."
-                )
+                logger.error("❌ PDF_PARSER=llamaparse mas LLAMA_CLOUD_API_KEY ausente!")
             else:
                 logger.info("🦙 Parser activo: LlamaParse (cloud — pago por página)")
         else:
@@ -218,21 +208,7 @@ class Ingestor:
     def ingerir_se_necessario(self) -> None:
         """
         Verifica ficheiro a ficheiro quais precisam de ser ingeridos.
-
-        FONTE DE VERDADE: manifesto em disco (DATA_DIR/.ingest_manifest.json)
-        ─────────────────────────────────────────────────────────────────────
-        Usa o hash do conteúdo do ficheiro para decidir se deve re-ingerir:
-          - Hash igual ao manifesto → skip (mesmo que Redis esteja a reiniciar)
-          - Hash diferente           → ficheiro mudou → re-ingere
-          - Não está no manifesto    → ficheiro novo → ingere
-
-        Vantagem sobre verificar só o Redis:
-          O Redis pode estar a iniciar no startup e o índice FT ainda não existe.
-          O manifesto em disco está sempre disponível imediatamente.
-
-        Para forçar re-ingestão:
-          - De um ficheiro: apaga a entrada no .ingest_manifest.json
-          - De tudo:        rm dados/.ingest_manifest.json
+        Usa o manifesto em disco como fonte de verdade primária.
         """
         data_dir  = settings.DATA_DIR
         ficheiros = self._listar_ficheiros(data_dir)
@@ -241,9 +217,8 @@ class Ingestor:
             logger.warning("⚠️  Nenhum ficheiro em %s", data_dir)
             return
 
-        manifesto  = _ler_manifesto()
-        pendentes  = []   # (caminho, motivo)
-        ignorados  = []
+        manifesto = _ler_manifesto()
+        pendentes = []
 
         for caminho in ficheiros:
             nome = os.path.basename(caminho)
@@ -254,7 +229,6 @@ class Ingestor:
             entrada     = manifesto.get(nome, {})
 
             if entrada.get("hash") == hash_actual:
-                ignorados.append(nome)
                 logger.info("💾 '%s' já ingerido (hash ok). Skip.", nome)
             else:
                 motivo = "novo" if nome not in manifesto else "modificado"
@@ -262,7 +236,7 @@ class Ingestor:
 
         if not pendentes:
             logger.info("✅ Todos os ficheiros já estão no manifesto. Nada a fazer.")
-            # Garante que o Redis também tem os dados (por se houve perda de dados)
+            # CORREÇÃO BUG 1: passa o lock para _verificar_redis_vs_manifesto
             self._verificar_redis_vs_manifesto(manifesto, ficheiros)
             return
 
@@ -280,44 +254,13 @@ class Ingestor:
                     "hash":   _hash_ficheiro(caminho),
                     "chunks": chunks,
                 }
-                _guardar_manifesto(manifesto)  # guarda após cada ficheiro
+                _guardar_manifesto(manifesto)
                 logger.info("✅ '%s': %d chunks → manifesto actualizado.", nome, chunks)
 
         self.diagnosticar()
 
-    def _verificar_redis_vs_manifesto(self, manifesto: dict, ficheiros: list) -> None:
-        """
-        Verifica se o Redis tem os dados que o manifesto diz existirem.
-        Se o Redis perdeu dados (ex: volume apagado), re-ingere silenciosamente.
-        Chamado apenas quando o manifesto diz que tudo está ok.
-        """
-        try:
-            sources_redis = _sources_no_redis()
-            em_falta      = []
-
-            for caminho in ficheiros:
-                nome = os.path.basename(caminho)
-                if nome in manifesto and nome not in sources_redis:
-                    em_falta.append(caminho)
-
-            if not em_falta:
-                return
-
-            logger.warning(
-                "⚠️  Manifesto diz ok mas Redis perdeu %d ficheiro(s): %s\n"
-                "   (Redis foi reiniciado sem volume persistente?)\n"
-                "   A re-ingerir no Redis sem actualizar manifesto...",
-                len(em_falta),
-                [os.path.basename(p) for p in em_falta],
-            )
-            for caminho in em_falta:
-                self._ingerir_ficheiro(caminho)
-
-        except Exception as e:
-            logger.debug("ℹ️  Verificação Redis vs manifesto falhou (ignorado): %s", e)
-
     def ingerir_tudo(self) -> None:
-        """Força re-ingestão de todos os ficheiros (ignora o que já existe)."""
+        """Força re-ingestão de todos os ficheiros."""
         data_dir  = settings.DATA_DIR
         ficheiros = self._listar_ficheiros(data_dir)
 
@@ -325,18 +268,15 @@ class Ingestor:
             logger.warning("⚠️  Nenhum ficheiro em %s", data_dir)
             return
 
-        logger.info("🕵️  Ingestão em: %s", data_dir)
-        logger.info("📁 Ficheiros: %s", [os.path.basename(f) for f in ficheiros])
-
+        logger.info("🕵️  Re-ingestão forçada em: %s", data_dir)
         total_chunks = 0
         for ficheiro in ficheiros:
             total_chunks += self._ingerir_ficheiro(ficheiro)
 
-        logger.info("✅ Ingestão concluída: %d chunks guardados no Redis.", total_chunks)
+        logger.info("✅ Re-ingestão concluída: %d chunks.", total_chunks)
         self.diagnosticar()
 
     def diagnosticar(self) -> set[str]:
-        """Retorna e loga os sources presentes no Redis."""
         sources = _sources_no_redis()
         print("=" * 60)
         print("🔍 DIAGNÓSTICO — Redis Stack")
@@ -354,7 +294,6 @@ class Ingestor:
     # ── Ingestão por ficheiro ─────────────────────────────────────────────────
 
     def _ingerir_ficheiro(self, caminho: str) -> int:
-        """Processa um ficheiro e guarda os chunks no Redis. Retorna nº de chunks."""
         nome   = os.path.basename(caminho)
         config = PDF_CONFIG.get(nome)
 
@@ -366,7 +305,6 @@ class Ingestor:
         eh_txt = nome.lower().endswith(".txt")
 
         try:
-            # 1. Extrai texto — TXT directo, PDF via parser configurado
             if eh_txt:
                 texto_raw = _ler_txt(caminho)
             else:
@@ -376,20 +314,16 @@ class Ingestor:
                 logger.warning("⚠️  '%s' está vazio após parsing.", nome)
                 return 0
 
-            # 2. Limpa
             texto_limpo = _limpar_texto(texto_raw)
-
-            # 3. Chunks com metadados hierárquicos
             chunks = list(_criar_chunks(texto_limpo, nome, config))
+
             if not chunks:
                 logger.warning("⚠️  Nenhum chunk gerado para '%s'.", nome)
                 return 0
 
-            # 4. Embeddings em batch
             textos_para_embed = [c.texto_puro for c in chunks]
             embeddings = self._embeddings.embed_documents(textos_para_embed)
 
-            # 5. Guarda no Redis
             for chunk, embedding in zip(chunks, embeddings):
                 chunk_id = _gerar_chunk_id(nome, chunk.chunk_index)
                 salvar_chunk(
@@ -409,12 +343,104 @@ class Ingestor:
             logger.exception("❌ Erro ao ingerir '%s': %s", nome, e)
             return 0
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
     def _listar_ficheiros(self, data_dir: str) -> list[str]:
         pdfs = glob.glob(os.path.join(data_dir, "*.[pP][dD][fF]"))
         txts = glob.glob(os.path.join(data_dir, "*.[tT][xX][tT]"))
         return sorted(pdfs + txts)
+
+    # ── CORREÇÃO BUG 1: _verificar_redis_vs_manifesto com lock por ficheiro ───
+
+    def _verificar_redis_vs_manifesto(self, manifesto: dict, ficheiros: list) -> None:
+        """
+        Verifica se o Redis tem os dados que o manifesto diz existirem.
+
+        CORREÇÃO DA DUPLA INGESTÃO:
+        ────────────────────────────
+        Problema original: ambos os workers chegavam aqui simultaneamente,
+        ambos viam Redis vazio, ambos iniciavam re-ingestão com LlamaParse → $$ duplo.
+
+        Solução: lock distribuído Redis POR FICHEIRO com double-check.
+
+        Fluxo corrigido (2 workers simultâneos, Redis vazio):
+          Worker-1: detecta calendário em falta → tenta adquirir lock:ingestao:calendário
+                    → adquire → ingere → libera lock
+          Worker-2: detecta calendário em falta → tenta adquirir lock:ingestao:calendário
+                    → BLOQUEADO (Worker-1 tem o lock)
+                    → lock liberado → adquire → DOUBLE-CHECK: Redis já tem o calendário
+                    → skip (0 chamadas LlamaParse extras)
+
+        Lock por ficheiro vs. lock global:
+          Lock global: Worker-2 espera Worker-1 terminar TODOS os PDFs (5-10 min).
+          Lock por ficheiro: Workers podem ingerir PDFs DIFERENTES em paralelo.
+          Ex: Worker-1 ingere calendário enquanto Worker-2 ingere edital → 2x mais rápido.
+        """
+        try:
+            sources_redis = _sources_no_redis()
+            em_falta = [
+                caminho for caminho in ficheiros
+                if os.path.basename(caminho) in manifesto
+                and os.path.basename(caminho) not in sources_redis
+            ]
+
+            if not em_falta:
+                return  # Redis tem tudo — caminho feliz
+
+            logger.warning(
+                "⚠️  Manifesto diz ok mas Redis perdeu %d ficheiro(s): %s\n"
+                "   (Redis foi reiniciado sem volume persistente?)\n"
+                "   A re-ingerir com lock distribuído para evitar duplicação...",
+                len(em_falta),
+                [os.path.basename(p) for p in em_falta],
+            )
+
+            r_text = get_redis_text()
+
+            for caminho in em_falta:
+                nome     = os.path.basename(caminho)
+                lock_key = f"lock:ingestao:{nome}"
+
+                lock = r_text.lock(
+                    lock_key,
+                    timeout          = 300,   # 5 min: tempo máximo para ingerir 1 PDF
+                    blocking_timeout = 310,   # espera até o outro worker terminar
+                )
+
+                logger.info("⏳ [%s] Aguardando lock de ingestão...", nome)
+                acquired = lock.acquire()
+
+                if not acquired:
+                    logger.warning(
+                        "⚠️  [%s] Timeout aguardando lock — outro worker demorou muito. "
+                        "Prosseguindo sem lock (pode causar duplicação).",
+                        nome,
+                    )
+                    self._ingerir_ficheiro(caminho)
+                    continue
+
+                try:
+                    # DOUBLE-CHECK: re-verifica se o ficheiro foi ingerido
+                    # enquanto esperávamos pelo lock (pelo Worker-1)
+                    sources_atuais = _sources_no_redis()
+                    if nome in sources_atuais:
+                        logger.info(
+                            "✅ [%s] Já foi ingerido por outro worker enquanto aguardávamos. Skip.",
+                            nome,
+                        )
+                        continue
+
+                    # Ainda não está no Redis — somos o worker responsável
+                    logger.info("🔒 [%s] Lock adquirido. Iniciando ingestão exclusiva.", nome)
+                    self._ingerir_ficheiro(caminho)
+
+                finally:
+                    try:
+                        lock.release()
+                        logger.info("🔓 [%s] Lock de ingestão liberado.", nome)
+                    except Exception:
+                        pass  # Lock pode já ter expirado — normal se a ingestão demorou
+
+        except Exception as e:
+            logger.warning("⚠️  _verificar_redis_vs_manifesto falhou: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -422,23 +448,12 @@ class Ingestor:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parsear_pdf(caminho: str, config: dict) -> str:
-    """
-    Despacha para o parser correcto.
-
-    Ordem de prioridade:
-      1. config["parser"] — parser específico para este ficheiro (se definido)
-      2. settings.PDF_PARSER — parser global do .env
-      3. fallback para pymupdf se o LlamaParse falhar ou não tiver API key
-    """
-    # Parser por ficheiro tem prioridade sobre o global
+    """Despacha para o parser correto. Prioridade: config["parser"] > settings.PDF_PARSER."""
     parser_nome = config.get("parser") or settings.PDF_PARSER.lower()
 
     if parser_nome == "llamaparse":
         if not settings.LLAMA_CLOUD_API_KEY:
-            logger.warning(
-                "⚠️  LlamaParse pedido mas LLAMA_CLOUD_API_KEY ausente. "
-                "A usar pymupdf como fallback."
-            )
+            logger.warning("⚠️  LlamaParse pedido mas API key ausente. Usando pymupdf.")
             return _parsear_com_pymupdf(caminho)
         return _parsear_com_llamaparse(caminho, config)
 
@@ -446,78 +461,51 @@ def _parsear_pdf(caminho: str, config: dict) -> str:
 
 
 def _parsear_com_pymupdf(caminho: str) -> str:
-    """
-    Extrai texto com pymupdf (fitz).
-
-    PRÓS:  local, gratuito, ~50ms/página, sem limite
-    CONTRAS: PDFs baseados em imagem/scan devolvem texto vazio.
-             Nesse caso activa PDF_PARSER=llamaparse no .env.
-
-    INSTALA: pip install pymupdf
-    """
     try:
         import fitz
-        doc       = fitz.open(caminho)
-        paginas   = []
-        nome      = os.path.basename(caminho)
-        n_total   = len(doc)
-
-        for pagina in doc:
-            texto = pagina.get_text("text")
-            if texto.strip():
-                paginas.append(texto)
+        doc     = fitz.open(caminho)
+        paginas = [p.get_text("text") for p in doc if p.get_text("text").strip()]
         doc.close()
+
         if not paginas:
-            logger.warning( "pymupdf: 0 páginas com texto em '%s' ('%d' págs)."
-
-                            ,"PDF provavelmente baseado em imagem/scan.",
-
-                            "Solução: adiciona PDF_PARSER=llamaparse ao .env e LLAMA_CLOUD_API_KEY=llx-...,"
-
-                            ,nome, n_total,
-
-                                )
+            nome = os.path.basename(caminho)
+            logger.warning(
+                "⚠️  pymupdf: 0 páginas com texto em '%s'. "
+                "PDF baseado em imagem/scan? Tenta PDF_PARSER=llamaparse no .env.",
+                nome,
+            )
         else:
-            logger.debug("📄 pymupdf: %d/%d páginas | '%s'", len(paginas), n_total, nome)
+            logger.debug("📄 pymupdf: %d páginas | '%s'", len(paginas), os.path.basename(caminho))
 
         return "\n\n".join(paginas)
 
     except ImportError:
-        logger.error("❌ pymupdf não instalado. Executa: pip install pymupdf")
+        logger.error("❌ pymupdf não instalado: pip install pymupdf")
         raise
     except Exception as e:
-        logger.exception("❌ pymupdf falhou em '%s': %s", caminho, e)
+        logger.exception("❌ pymupdf falhou: %s", e)
         return ""
 
 
 def _parsear_com_llamaparse(caminho: str, config: dict) -> str:
     """
-    Extrai texto com LlamaParse (API cloud Llama Index).
+    Extrai texto com LlamaParse.
 
-    PRÓS:  excelente com tabelas complexas, colunas, layouts difíceis
-    CONTRAS: pago (~$0.003/página), lento (round-trip cloud), precisa de API key
-
-    ACTIVA NO .env:
-      PDF_PARSER=llamaparse
-      LLAMA_CLOUD_API_KEY=llx-...
-
-    INSTALA: pip install llama-parse
-
-    A parsing_instruction é lida do PDF_CONFIG["parsing_instruction"].
-    Se não estiver definida, usa uma instrução genérica.
+    CORREÇÃO BUG 2: parsing_instruction foi depreciado no LlamaParse v0.3+.
+    Agora usamos system_prompt (equivalente funcional).
+    O PDF_CONFIG ainda aceita a chave "parsing_instruction" por retrocompatibilidade
+    — ela é lida e passada internamente como system_prompt.
     """
     try:
         from llama_parse import LlamaParse
     except ImportError:
-        logger.error(
-            "❌ llama-parse não instalado. Executa: pip install llama-parse\n"
-            "   A fazer fallback para pymupdf."
-        )
+        logger.error("❌ llama-parse não instalado: pip install llama-parse. Usando pymupdf.")
         return _parsear_com_pymupdf(caminho)
 
+    # Retrocompatibilidade: aceita "parsing_instruction" mas passa como system_prompt
     instrucao = config.get("parsing_instruction") or (
         "Extrai todo o texto preservando a estrutura de tabelas. "
-        "Para tabelas, usa o formato: COLUNA1: valor | COLUNA2: valor. "
+        "Para tabelas, usa: COLUNA1: valor | COLUNA2: valor. "
         "Responde em português."
     )
 
@@ -527,25 +515,20 @@ def _parsear_com_llamaparse(caminho: str, config: dict) -> str:
             result_type="markdown",
             language="pt",
             verbose=False,
-            parsing_instruction=instrucao,
+            # CORREÇÃO: system_prompt em vez de parsing_instruction (depreciado)
+            system_prompt=instrucao,
         )
         docs    = parser.load_data(caminho)
         paginas = [doc.text for doc in docs if doc.text.strip()]
-        logger.debug(
-            "🦙 LlamaParse: %d páginas extraídas de '%s'",
-            len(paginas), os.path.basename(caminho),
-        )
+        logger.debug("🦙 LlamaParse: %d páginas | '%s'", len(paginas), os.path.basename(caminho))
         return "\n\n".join(paginas)
+
     except Exception as e:
-        logger.exception(
-            "❌ LlamaParse falhou em '%s': %s\n   A fazer fallback para pymupdf.",
-            caminho, e,
-        )
+        logger.exception("❌ LlamaParse falhou em '%s': %s. Usando pymupdf.", caminho, e)
         return _parsear_com_pymupdf(caminho)
 
 
 def _ler_txt(caminho: str) -> str:
-    """Lê ficheiro .txt com detecção de encoding."""
     for encoding in ("utf-8", "latin-1", "cp1252"):
         try:
             with open(caminho, "r", encoding=encoding) as f:
@@ -568,77 +551,63 @@ def _criar_chunks(texto: str, nome_ficheiro: str, config: dict) -> Iterator[Chun
       [EDITAL PAES 2026 | edital]
       CURSO: Engenharia Civil | AC: 40 | PcD: 2 | TOTAL: 42
 
-    O LLM vê a fonte ANTES do conteúdo → ancora a resposta.
+    O LLM vê a fonte ANTES do conteúdo → ancora a resposta e reduz alucinações.
     """
-    chunk_size  = config["chunk_size"]
-    overlap     = config["overlap"]
-    label       = config["label"]
-    doc_type    = config["doc_type"]
-    prefixo     = f"[{label} | {doc_type}]\n"
+    label    = config.get("label", nome_ficheiro.upper())
+    doc_type = config.get("doc_type", "geral")
+    titulo   = config.get("titulo", nome_ficheiro)
+    size     = config.get("chunk_size", 400)
+    overlap  = config.get("overlap", 50)
 
-    paragrafos  = _dividir_em_paragrafos(texto)
-    buffer      = ""
-    chunk_index = 0
+    prefixo_hierarquico = f"[{label} | {doc_type}]\n"
+
+    partes = _dividir_texto(texto, size, overlap)
+
+    for i, parte in enumerate(partes):
+        texto_final = prefixo_hierarquico + parte
+
+        yield ChunkBruto(
+            texto_puro  = parte,
+            texto_final = texto_final,
+            source      = nome_ficheiro,
+            doc_type    = doc_type,
+            chunk_index = i,
+            metadata    = {
+                "titulo":      titulo,
+                "chunk_index": i,
+                "total_parts": len(partes),
+            },
+        )
+
+
+def _dividir_texto(texto: str, chunk_size: int, overlap: int) -> list[str]:
+    """Divisão por parágrafos com fallback para divisão por tamanho."""
+    paragrafos = [p.strip() for p in re.split(r"\n{2,}", texto) if p.strip()]
+    chunks: list[str] = []
+    atual = ""
 
     for paragrafo in paragrafos:
-        paragrafo = paragrafo.strip()
-        if not paragrafo:
-            continue
+        candidato = f"{atual}\n\n{paragrafo}".strip() if atual else paragrafo
 
-        if len(paragrafo) > chunk_size * 1.5:
-            if buffer.strip():
-                yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
-                chunk_index += 1
-                buffer = buffer[-overlap:] if overlap else ""
-            for parte in _dividir_em_sentencas(paragrafo, chunk_size, overlap):
-                yield _fazer_chunk(parte, prefixo, nome_ficheiro, doc_type, chunk_index)
-                chunk_index += 1
-            continue
-
-        candidato = buffer + ("\n" if buffer else "") + paragrafo
         if len(candidato) <= chunk_size:
-            buffer = candidato
+            atual = candidato
         else:
-            if buffer.strip():
-                yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
-                chunk_index += 1
-            buffer = buffer[-overlap:] + "\n" + paragrafo if overlap else paragrafo
+            if atual:
+                chunks.append(atual)
+            # Parágrafo maior que chunk_size → divide por tamanho
+            if len(paragrafo) > chunk_size:
+                for inicio in range(0, len(paragrafo), chunk_size - overlap):
+                    parte = paragrafo[inicio: inicio + chunk_size]
+                    if parte.strip():
+                        chunks.append(parte)
+                atual = ""
+            else:
+                atual = paragrafo
 
-    if buffer.strip():
-        yield _fazer_chunk(buffer, prefixo, nome_ficheiro, doc_type, chunk_index)
+    if atual:
+        chunks.append(atual)
 
-
-def _fazer_chunk(texto_puro, prefixo, source, doc_type, chunk_index) -> ChunkBruto:
-    return ChunkBruto(
-        texto_puro=texto_puro.strip(),
-        texto_final=prefixo + texto_puro.strip(),
-        source=source,
-        doc_type=doc_type,
-        chunk_index=chunk_index,
-        metadata={"titulo_fonte": prefixo.strip("[]").split("|")[0].strip()},
-    )
-
-
-def _dividir_em_paragrafos(texto: str) -> list[str]:
-    blocos = re.split(r"\n{2,}", texto)
-    if len(blocos) > 3:
-        return blocos
-    return texto.split("\n")
-
-
-def _dividir_em_sentencas(texto: str, chunk_size: int, overlap: int) -> list[str]:
-    partes, inicio = [], 0
-    while inicio < len(texto):
-        fim    = inicio + chunk_size
-        if fim >= len(texto):
-            partes.append(texto[inicio:])
-            break
-        espaco = texto.rfind(" ", inicio, fim)
-        if espaco > inicio:
-            fim = espaco
-        partes.append(texto[inicio:fim].strip())
-        inicio = fim - overlap if overlap else fim
-    return [p for p in partes if p.strip()]
+    return chunks or [texto[:chunk_size]]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -668,7 +637,7 @@ def _gerar_chunk_id(source: str, index: int) -> str:
 
 
 def _sources_no_redis() -> set[str]:
-    """Sources únicos no Redis — usa FT.AGGREGATE (rápido) com fallback SCAN."""
+    """Sources únicos no Redis — usa FT.AGGREGATE com fallback SCAN."""
     from src.infrastructure.redis_client import IDX_CHUNKS
     from redis.commands.search.aggregation import AggregateRequest
     from redis.commands.search.reducers import count as ft_count
@@ -676,9 +645,9 @@ def _sources_no_redis() -> set[str]:
     r = get_redis()
 
     try:
-        req      = AggregateRequest("*").group_by("@source", ft_count().alias("n"))
+        req       = AggregateRequest("*").group_by("@source", ft_count().alias("n"))
         resultado = r.ft(IDX_CHUNKS).aggregate(req)
-        sources  = set()
+        sources   = set()
         for row in resultado.rows:
             it       = iter(row)
             row_dict = {k: v for k, v in zip(it, it)}
@@ -689,6 +658,7 @@ def _sources_no_redis() -> set[str]:
     except Exception:
         pass
 
+    # Fallback: SCAN manual
     sources: set[str] = set()
     cursor = 0
     while True:

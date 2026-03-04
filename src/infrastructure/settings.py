@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     #
     # Podes também forçar por ficheiro individual no PDF_CONFIG (ingestion.py):
     #   "edital_paes_2026.pdf": { ..., "parser": "llamaparse" }
-    PDF_PARSER: str = "pymupdf"
+    PDF_PARSER: str = "llamaparse"
 
     # ── LlamaParse (só necessário se PDF_PARSER=llamaparse) ───────────────────
     # Obtém em: https://cloud.llamaindex.ai

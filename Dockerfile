@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y \
 #    Enquanto requirements.txt não mudar, o Docker reutiliza esta camada em cache.
 #    Mudar só o código em src/ não refaz o pip install.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --timeout 1000 -r requirements.txt
 
 # 3. Copia o código-fonte
 #    O volume ./src:/app/src no docker-compose.yml sobrescreve em dev (hot-reload).
