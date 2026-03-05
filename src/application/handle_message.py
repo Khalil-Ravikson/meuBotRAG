@@ -1,53 +1,25 @@
 """
-application/handle_message.py — A Ponte (v3 — Clean Architecture)
-==================================================================
+application/handle_message.py — A Ponte (v4 — Clean Architecture Pura)
+======================================================================
 
 RESPONSABILIDADE DESTE FICHEIRO:
 ──────────────────────────────────
   Este ficheiro é a "cola" entre a comunicação WhatsApp (Evolution API)
-  e o novo AgentCore. É deliberadamente FINO — toda a lógica de negócio
-  vive nos módulos especializados.
+  e o AgentCore. 
 
   Fluxo resumido:
     1. Recebe Mensagem (domain entity) vinda do handle_webhook.py
-    2. Carrega estado do menu do Redis
-    3. Passa pelo domain/menu.py → navegação directa OU aciona AgentCore
-    4. Envia resposta via EvolutionService (ou WahaService — interface idêntica)
+    2. Valida se tem texto ou apenas media
+    3. Aciona o AgentCore.responder() numa thread separada
+    4. Envia resposta via EvolutionService (ou WahaService)
 
-O QUE MUDOU vs v2:
-─────────────────────
-  ANTES:
-    handle_message.py → domain/menu.py → domain/router.py (regex)
-                      → agent/prompts.py → AgentState → AgentCore (LangChain)
-                      → evolution_service.enviar_mensagem()
-
-  AGORA:
-    handle_message.py → domain/menu.py (mantido intacto)
-                      → AgentCore.responder() [novo — pipeline limpa]
-                      → evolution_service.enviar_mensagem() (mantido intacto)
-
-  Removido:
-    - Criação manual de AgentState (substituído por parâmetros simples)
-    - Importação de domain/router.py (feita dentro do semantic_router)
-    - Importação de agent/prompts.py (prompts vivem no gemini_provider)
-    - Importação de memory/redis_memory.py (parcialmente — estado menu mantém)
-
-  Mantido intacto:
-    - domain/menu.py (lógica de menu não muda)
-    - memory/redis_memory.py (get_estado_menu, set_estado_menu, set_contexto)
-    - EvolutionService (comunicação WhatsApp não muda)
-
-COMPATIBILIDADE COM WAHA:
-──────────────────────────
-  O ficheiro importa EvolutionService por padrão.
-  Se ainda usas WahaService, basta trocar a importação — a interface
-  .enviar_mensagem(chat_id, texto) é idêntica nos dois serviços.
-
-TRATAMENTO DE MENSAGENS VAZIAS E MEDIA:
-────────────────────────────────────────
-  - Mensagem vazia → ignora silenciosamente (log DEBUG)
-  - Mensagem com media mas sem texto → resposta padrão informativa
-  - Mensagem com media + legenda → processa a legenda normalmente
+O QUE MUDOU NA v4 (Remoção do Menu/Estado):
+───────────────────────────────────────────
+  - Todo o sistema de menus engessados (domain/menu.py) foi ELIMINADO.
+  - O controlo de EstadoMenu no Redis foi ELIMINADO.
+  - As saudações e bloqueios (Guardrails) agora são geridos de forma
+    inteligente dentro do próprio `agent_core`.
+  - O código ficou extremamente limpo, focado apenas em I/O (Entrada/Saída).
 """
 from __future__ import annotations
 
@@ -55,14 +27,8 @@ import asyncio
 import logging
 
 from src.agent.core import agent_core
-from src.domain.entities import EstadoMenu, Mensagem
-from src.domain.menu import processar_mensagem
-from src.memory.redis_memory import (
-    clear_estado_menu,
-    get_estado_menu,
-    set_contexto,
-    set_estado_menu,
-)
+from src.domain.entities import Mensagem
+from src.memory.redis_memory import set_contexto
 from src.services.evolution_service import EvolutionService
 
 logger = logging.getLogger(__name__)
@@ -73,18 +39,13 @@ _MSG_MEDIA_SEM_TEXTO = (
     "Digita a tua dúvida que te respondo rapidinho."
 )
 
-
 async def handle_message(mensagem: Mensagem, evolution: EvolutionService) -> None:
     """
     Orquestra o fluxo completo de uma mensagem recebida.
 
     ESTE MÉTODO É ASSÍNCRONO para integrar com o FastAPI sem bloquear
-    o event loop. O AgentCore.responder() é síncrono mas é executado
+    o event loop. O AgentCore.responder() é executado
     via asyncio.to_thread() para não bloquear.
-
-    Parâmetros:
-      mensagem:  Mensagem normalizada (vinda do handle_webhook.py)
-      evolution: Serviço de envio WhatsApp (injetado)
     """
     user_id = mensagem.user_id
     chat_id = mensagem.chat_id
@@ -102,60 +63,30 @@ async def handle_message(mensagem: Mensagem, evolution: EvolutionService) -> Non
 
     logger.info("📨 [%s] '%s'", user_id, body[:80])
 
-    # ── 2. Carrega estado do menu do Redis ────────────────────────────────────
-    estado_atual: EstadoMenu = get_estado_menu(user_id)
-
-    # ── 3. domain/menu.py — decisão de navegação (stateless, regex puro) ─────
-    resultado_menu = processar_mensagem(body, estado_atual)
-
-    # ── 4a. Resposta directa de menu (sem LLM) ────────────────────────────────
-    if resultado_menu["type"] in ("menu_principal", "submenu"):
-        novo_estado: EstadoMenu = resultado_menu["novo_estado"]
-        set_estado_menu(user_id, novo_estado)
-
-        logger.debug("📋 Menu [%s]: %s → %s", user_id, estado_atual.value, novo_estado.value)
-        await evolution.enviar_mensagem(chat_id, resultado_menu["content"])
-        return
-
-    # ── 4b. Actualiza estado do menu ──────────────────────────────────────────
-    novo_estado = resultado_menu["novo_estado"]
-    if novo_estado != estado_atual:
-        if novo_estado == EstadoMenu.MAIN:
-            clear_estado_menu(user_id)
-        else:
-            set_estado_menu(user_id, novo_estado)
-
-    # ── 5. Determina o texto a processar pelo AgentCore ───────────────────────
-    # Se o menu expandiu a pergunta (ex: opção "1" do submenu calendário),
-    # usa o prompt expandido. Caso contrário usa o body original.
-    texto_para_agente = resultado_menu.get("prompt") or body
-
-    # ── 6. Aciona o novo AgentCore (pipeline Gemini + Redis) ─────────────────
+    # ── 2. Aciona o AgentCore (pipeline Gemini + Redis + Guardrails) ─────────
     # asyncio.to_thread() executa o código síncrono do AgentCore sem bloquear
     # o event loop do FastAPI — essencial para alta concorrência
-    logger.info("🤖 AgentCore [%s] estado=%s texto='%s'",
-                user_id, estado_atual.value, texto_para_agente[:60])
+    logger.info("🤖 AgentCore [%s] a processar texto='%s'", user_id, body[:60])
 
     resposta_obj = await asyncio.to_thread(
         agent_core.responder,
         user_id=user_id,
         session_id=user_id,          # session_id = user_id para bots WhatsApp 1:1
-        mensagem=texto_para_agente,
-        estado_menu=estado_atual,
+        mensagem=body,
     )
 
-    # ── 7. Persiste contexto (última intenção) — compatibilidade redis_memory ─
+    # ── 3. Persiste contexto (última intenção) ────────────────────────────────
     # Mantemos set_contexto() para não quebrar o endpoint /logs e diagnósticos
     set_contexto(user_id, {"ultima_intencao": resposta_obj.rota.value})
 
-    # ── 8. Envia resposta via Evolution API ───────────────────────────────────
+    # ── 4. Envia resposta via Evolution API ───────────────────────────────────
     conteudo = resposta_obj.conteudo or _MSG_MEDIA_SEM_TEXTO
     await evolution.enviar_mensagem(chat_id, conteudo)
 
     logger.info(
-        "✅ Resposta enviada [%s] | rota=%s | tokens=%d | sucesso=%s",
+        "✅ Resposta enviada [%s] | rota=%s | latência=%dms | sucesso=%s",
         user_id,
         resposta_obj.rota.value,
-        resposta_obj.tokens_total,
+        getattr(resposta_obj, 'latencia_ms', 0),
         resposta_obj.sucesso,
     )

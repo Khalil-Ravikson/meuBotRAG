@@ -48,21 +48,22 @@ ARQUITETURA DO LOCK DE INGESTÃO:
   Resultado: ingestão acontece EXATAMENTE UMA VEZ por restart do container.
 """
 from __future__ import annotations
-
+from typing import TYPE_CHECKING  # 1. Importe o TYPE_CHECKING
 import asyncio
 import logging
 import threading
 
 from src.infrastructure.celery_app import celery_app
 from src.infrastructure.redis_client import get_redis_text
-
+if TYPE_CHECKING:
+    from src.services.evolution_service import EvolutionService
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Singletons do processo worker
 # ─────────────────────────────────────────────────────────────────────────────
 _init_lock         = threading.Lock()   # Lock local (intra-processo)
-_evolution_service = None
+_evolution_service : EvolutionService | None = None
 
 
 async def _get_evolution() -> "EvolutionService":

@@ -1,38 +1,12 @@
 """
-middleware/dev_guard.py — v9 (Evolution API v2.3.7+)
-=====================================================
-
-CONTEXTO @LID (história completa):
-  O @lid é um ID interno do WhatsApp usado quando o remetente usa dispositivo
-  vinculado (WhatsApp Web/Desktop). O número real não é divulgado pela API.
-
-  Histórico de versões Evolution API:
-    ≤ v2.2.3  → @lid no remoteJid, sem resolução → erro 400 garantido
-    v2.3.0–4  → senderPn intermitente, inconsistente
-    v2.3.5+   → resolve @lid via call rejection silenciosa → chega @s.whatsapp.net
-
-  Com v2.3.7 (versão actual) o remoteJid deve chegar resolvido na maioria dos
-  casos. Mantemos senderPn como fallback para os casos edge ainda existentes.
-
-CAMPOS DO PAYLOAD (Evolution v2.3.7):
-  "event": "messages.upsert"
-  "sender": "559887400509@s.whatsapp.net"   ← instância do BOT (nunca usar para reply)
-  "data": {
-    "key": {
-      "remoteJid": "559812345678@s.whatsapp.net",  ← resolvido pela v2.3.5+
-       OU (caso edge ainda possível)
-      "remoteJid": "191555725959219@lid",           ← fallback: usa senderPn
-    },
-    "senderPn": "559812345678@s.whatsapp.net",      ← presente quando remoteJid = @lid
-    "pushName": "Nome do Utilizador",
-    "message": { "conversation": "Olá" },
-    "messageType": "conversation"
-  }
+middleware/dev_guard.py — v10 (Evolution API v2.3.7+ com Bloqueio de Histórico)
+================================================================================
 """
 from __future__ import annotations
 import json
 import uuid
 import logging
+import time  # ── IMPORTANTE: Adicionado para verificar o timestamp
 
 from src.infrastructure.settings import settings
 
@@ -52,30 +26,17 @@ def _normalizar_numero(jid: str) -> str:
 
 
 def _resolver_chat_id(key: dict, msg_data: dict) -> str | None:
-    """
-    Resolve o chat_id para enviar a resposta.
-
-    Prioridade (v2.3.7+):
-      1. remoteJid @s.whatsapp.net → caso normal e caso resolvido pela v2.3.5+
-      2. senderPn @s.whatsapp.net  → fallback para @lid ainda não resolvido
-      3. None                       → não resolvível, rejeita a mensagem
-
-    NUNCA usa data.sender (= número da instância do bot).
-    """
     remote_jid = key.get("remoteJid", "")
 
-    # Caso 1: número real já presente (normal, ou resolvido pela v2.3.5+)
     if "@s.whatsapp.net" in remote_jid:
         return remote_jid
 
-    # Caso 2: ainda @lid (edge case) — tenta senderPn da v2.3.0+
     if "@lid" in remote_jid:
         sender_pn = msg_data.get("senderPn", "")
         if sender_pn and "@s.whatsapp.net" in sender_pn:
             logger.info("📱 @lid resolvido via senderPn: %s → %s", remote_jid, sender_pn)
             return sender_pn
 
-        # Sem senderPn: não resolvível nesta versão
         logger.warning(
             "⚠️  @lid sem senderPn. remoteJid=%s\n"
             "   A Evolution API v2.3.7 devia ter resolvido isto.\n"
@@ -84,7 +45,6 @@ def _resolver_chat_id(key: dict, msg_data: dict) -> str | None:
         )
         return None
 
-    # Formato inesperado (broadcast/newsletter já filtrados antes)
     logger.warning("⚠️  remoteJid formato desconhecido: %s", remote_jid)
     return None
 
@@ -111,18 +71,19 @@ class DevGuard:
             )
         elif self.dev_mode:
             logger.info(
-                "🛡️  DevGuard v9 (Evolution v2.3.7+) | DEV_MODE=True | whitelist=%s",
+                "🛡️  DevGuard v10 (Evolution v2.3.7+) | DEV_MODE=True | whitelist=%s",
                 self.dev_whitelist,
             )
         else:
-            logger.info("🛡️  DevGuard v9 (Evolution v2.3.7+) | DEV_MODE=False | todas as msgs passam")
+            logger.info("🛡️  DevGuard v10 (Evolution v2.3.7+) | DEV_MODE=False | todas as msgs passam")
 
     async def validar(self, data: dict) -> tuple[bool, dict | str]:
         """
         Valida e filtra payload da Evolution API v2.3.7.
         Retorno: (True, identity) → aprovado | (False, motivo) → bloqueado
         """
-        logger.debug("📦 Payload: %s", json.dumps(data, ensure_ascii=False)[:400])
+        # (Opcional) Podes comentar a linha abaixo se os logs do payload ficarem muito grandes
+        # logger.debug("📦 Payload: %s", json.dumps(data, ensure_ascii=False)[:400])
 
         # ── 1. Filtro de evento ────────────────────────────────────────────────
         evento = data.get("event", "")
@@ -139,10 +100,28 @@ class DevGuard:
             logger.warning("⚠️  messages.upsert sem campo 'data'")
             return False, "empty_payload"
 
+        # ── 2.5 FILTRO DE TIMESTAMP (Bloqueia mensagens velhas da sincronização) ──
+        msg_timestamp = msg_data.get("messageTimestamp")
+        if msg_timestamp:
+            try:
+                agora = int(time.time())
+                ts = int(msg_timestamp)
+                
+                # Se o timestamp vier em milissegundos (muito grande), converte para segundos
+                if ts > 9999999999:
+                    ts = ts // 1000
+                
+                # Se a mensagem tiver mais de 120 segundos (2 minutos), é ignorada
+                if (agora - ts) > 120:
+                    logger.debug("⏭️  Mensagem antiga ignorada (%ds de atraso)", agora - ts)
+                    return False, "ignored_old_message"
+            except (ValueError, TypeError):
+                pass  # Se der erro ao ler a data, deixa passar e os outros filtros resolvem
+
         key        = msg_data.get("key", {})
         remote_jid = key.get("remoteJid", "")
 
-        # ── 3. Ignora mensagens próprias (enviadas pelo bot) ───────────────────
+        # ── 3. Ignora mensagens próprias (enviadas pelo bot/ti mesmo) ───────────
         if key.get("fromMe", False):
             logger.debug("⏭️  fromMe=true — ignorado.")
             return False, "ignored_self"

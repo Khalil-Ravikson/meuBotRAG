@@ -73,8 +73,8 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 # Modelos disponíveis (fallback automático se o primário saturar)
-MODELO_PRIMARIO = "gemini-2.5-flash"
-MODELO_FALLBACK = "gemini-2.0-flash-lite"
+MODELO_PRIMARIO = "gemini-3.1-flash-lite-preview"
+MODELO_FALLBACK = "Gemini 2.5 Flash TTS"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
