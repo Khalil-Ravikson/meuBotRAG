@@ -1,814 +1,577 @@
-# 🎓 Bot UEMA — Assistente Virtual WhatsApp com RAG
+# 🎓 meuBotRAG — Assistente Académico da UEMA
 
-Assistente virtual do WhatsApp da **UEMA Campus Paulo VI, São Luís-MA**, com arquitetura **Multi-step Agentic RAG** e **Clean Architecture** em 6 camadas.
-
-Responde perguntas sobre o Calendário Acadêmico 2026, Edital PAES 2026 e Contatos Institucionais usando PDFs ingeridos em um banco vetorial (pgvector), com LLM via Groq e histórico de conversas no Redis.
+> Assistente virtual académico integrado no WhatsApp, construído com **Clean Architecture**, **RAG Híbrido** e **memória em três camadas** — tudo a custo **$0**, rodando em hardware comum com Docker.
 
 ---
 
-## Índice
+## 📋 Índice
 
-1. [Pré-requisitos](#1-pré-requisitos)
-2. [O `.env` — entendendo de uma vez por todas](#2-o-env--entendendo-de-uma-vez-por-todas)
-3. [config.py vs settings.py — qual usar?](#3-configpy-vs-settingspy--qual-usar)
-4. [Quickstart — subindo em 5 passos](#4-quickstart--subindo-em-5-passos)
-5. [Desenvolvimento local sem Docker](#5-desenvolvimento-local-sem-docker)
-6. [Arquitetura — as 6 camadas](#6-arquitetura--as-6-camadas)
-7. [Estrutura de pastas](#7-estrutura-de-pastas)
-8. [Descrição de cada arquivo](#8-descrição-de-cada-arquivo)
-9. [Como uma mensagem é processada — pipeline completo](#9-como-uma-mensagem-é-processada--pipeline-completo)
-10. [Pipeline de testes](#10-pipeline-de-testes)
-11. [Painel de debug — Chainlit](#11-painel-de-debug--chainlit)
-12. [LangSmith — rastreamento do agente](#12-langsmith--rastreamento-do-agente)
-13. [Perguntas frequentes](#13-perguntas-frequentes)
+- [Visão Geral](#-visão-geral)
+- [Arquitectura](#-arquitectura)
+- [Pipeline de Processamento](#-pipeline-de-processamento)
+- [Stack Tecnológico](#-stack-tecnológico)
+- [Estrutura de Pastas](#-estrutura-de-pastas)
+- [Pré-requisitos](#-pré-requisitos)
+- [Configuração](#-configuração)
+- [Como Correr](#-como-correr)
+- [Endpoints da API](#-endpoints-da-api)
+- [Sistema de Memória](#-sistema-de-memória)
+- [RAG Híbrido](#-rag-híbrido)
+- [Roteamento Semântico](#-roteamento-semântico)
+- [Debug com Chainlit](#-debug-com-chainlit)
+- [Roadmap](#-roadmap)
 
 ---
 
-## 1. Pré-requisitos
+## 🔭 Visão Geral
 
-| Ferramenta | Versão | Para que serve |
+O **meuBotRAG** responde a dúvidas académicas dos alunos da UEMA directamente no WhatsApp. Ele consulta documentos institucionais (editais, calendário académico, guias de contactos) para dar respostas precisas, sem alucinar datas ou siglas.
+
+### O problema que resolve
+
+| Problema | Solução implementada |
+|---|---|
+| Alucinações em datas e siglas de editais | Busca Híbrida (BM25 + Vetor) com metadados hierárquicos |
+| Custos elevados com API de LLM | Gemini 1.5 Flash (Free Tier) + SemanticCache |
+| Rate limits no Groq | Migração completa para Google Gemini |
+| PostgreSQL/pgvector consome muita RAM | Redis Stack unifica cache, memória e vector store |
+| Sem memória entre conversas | Sistema de 3 camadas: Working Memory, Long-Term Facts, Sinais |
+| Timeout na Evolution API | Arquitectura assíncrona com fila Celery |
+
+### Comparação antes vs. depois
+
+```
+ANTES (v2 — LangChain + Groq + pgvector):
+  Mensagem → AgentExecutor → Groq (llama-3.1-8b)
+           → tool_calling loop (até 6 iterações)
+           → pgvector → resposta
+  Custo: ~4.300 tokens/msg | 500–1500ms | risco de rate limit
+
+DEPOIS (v4 — Clean Architecture):
+  Mensagem → Guardrails (0 tokens, regex)
+           → Working Memory + Long-Term Facts (Redis, 0 tokens, <1ms)
+           → Semantic Router (Redis KNN, 0 tokens, ~1ms)
+           → Query Transform (Gemini, ~120 tokens, 1 chamada leve)
+           → Hybrid Retriever (Redis BM25+Vector, 0 tokens, ~5ms)
+           → Gemini Flash (1 chamada limpa, ~950 tokens)
+           → Resposta
+  Custo: ~1.070 tokens/msg | 800–1200ms | free tier Gemini (1M TPM)
+```
+
+---
+
+## 🏛 Arquitectura
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         WhatsApp / Aluno                        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ POST /webhook
+┌──────────────────────────▼──────────────────────────────────────┐
+│                    FastAPI  (bot:9000)                           │
+│  DevGuard (dedup + spam) → Celery .delay() → HTTP 200 OK        │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ Redis Queue (DB 2)
+┌──────────────────────────▼──────────────────────────────────────┐
+│                   Celery Worker                                  │
+│                                                                  │
+│  ┌─ handle_message.py ──────────────────────────────────────┐   │
+│  │  Guardrails → AgentCore.responder()                      │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                                                                  │
+│  ┌─ AgentCore (9 passos) ────────────────────────────────────┐  │
+│  │  1. Working Memory     (Redis, <1ms)                      │  │
+│  │  2. Long-Term Facts    (Redis KNN, ~3ms)                  │  │
+│  │  3. Semantic Router    (Redis KNN, ~1ms, 0 tokens)        │  │
+│  │  4. Query Transform    (Gemini, ~120 tokens)              │  │
+│  │  5. Hybrid Retriever   (Redis BM25+Vector, ~5ms)          │  │
+│  │  6. Geração Final      (Gemini Flash, ~950 tokens)        │  │
+│  │  7. Persistência       (Redis, <1ms)                      │  │
+│  │  8. Memory Extractor   (background, não bloqueia)         │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────────┐
+│              Redis Stack  (redis:6379)                           │
+│                                                                  │
+│  DB 0:  idx:rag:chunks    → Chunks dos PDFs (BM25 + HNSW)       │
+│         idx:tools         → Tools para Semantic Router           │
+│         mem:work:{id}     → Working Memory (sinais de sessão)    │
+│         mem:facts:*       → Long-Term Factual Memory             │
+│         chat:{id}         → Histórico de mensagens               │
+│         menu_state:{id}   → Estado do menu por utilizador        │
+│  DB 2:  Fila Celery                                              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ⚙️ Pipeline de Processamento
+
+Cada mensagem percorre até 8 passos. Os primeiros 3 não chamam nenhum LLM — poupam tokens e latência.
+
+```
+Mensagem do aluno
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────┐
+│ PASSO 0 — Guardrails (regex, 0 tokens, 0ms)                 │
+│  Saudações → boas-vindas       | Ofensivos → bloqueio       │
+│  Fora de escopo → bloqueio     | Self-RAG signal → precisa_rag │
+└────────────────────────────┬────────────────────────────────┘
+                             │ bloquear=False
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 1 — Working Memory (Redis, <1ms)           │
+      │  Histórico compactado (sliding window 8 turns)   │
+      │  Sinais: última tool, rota, tópico               │
+      └──────────────────────┬──────────────────────────┘
+                             │
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 2 — Long-Term Facts (Redis KNN, ~3ms)      │
+      │  Busca fatos relevantes do aluno                  │
+      │  Ex: "Aluno de Eng. Civil, turno noturno"        │
+      └──────────────────────┬──────────────────────────┘
+                             │
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 3 — Semantic Router (Redis KNN, ~1ms)      │
+      │  Alta confiança (>0.80) → tool + source_filter   │
+      │  Média confiança (0.62–0.80) → tool + doc_type   │
+      │  Baixa confiança (<0.62) → Rota.GERAL            │
+      └──────────────────────┬──────────────────────────┘
+                             │
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 4 — Query Transform (Gemini, ~120 tokens)  │
+      │  Reescreve a pergunta com contexto dos fatos      │
+      │  Skip se alta confiança (economiza tokens)        │
+      └──────────────────────┬──────────────────────────┘
+                             │
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 5 — Hybrid Retriever (Redis, ~5ms)         │
+      │  BM25 (keywords exactas: datas, siglas)          │
+      │  Vetor (semântica: intenção da pergunta)          │
+      │  RRF (fusão dos ranks)                           │
+      │  Fallback step-back se 0 resultados              │
+      └──────────────────────┬──────────────────────────┘
+                             │
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 6 — Geração Gemini Flash (~950 tokens)     │
+      │  System + Fatos + Histórico + Contexto RAG       │
+      │  1 chamada limpa, sem tool-calling loop          │
+      └──────────────────────┬──────────────────────────┘
+                             │
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 7 — Persistência (Redis, <1ms)             │
+      │  Salva turn no histórico da sessão               │
+      └──────────────────────┬──────────────────────────┘
+                             │
+      ┌──────────────────────▼──────────────────────────┐
+      │ PASSO 8 — Memory Extractor (background)          │
+      │  Analisa o turn e extrai novos fatos             │
+      │  Não bloqueia a resposta ao utilizador           │
+      └─────────────────────────────────────────────────┘
+```
+
+---
+
+## 🛠 Stack Tecnológico
+
+| Componente | Tecnologia | Função |
 |---|---|---|
-| Docker + Docker Compose | 24+ | Rodar todos os serviços |
-| Python | 3.11 ou 3.12 | Dev local, testes, Chainlit |
-| ngrok ou domínio público | — | Expor o bot ao WhatsApp |
+| **LLM** | Google Gemini 2.0 Flash (Free Tier) | Geração de respostas, query transform, extracção de fatos |
+| **Embeddings** | BAAI/bge-m3 (local, CPU) | Vectores de 1024 dims para busca semântica |
+| **Vector Store** | Redis Stack (HNSW) | Chunks dos PDFs + tool routing |
+| **BM25** | Redis Stack (RediSearch) | Busca por keywords exactas |
+| **Fila** | Celery + Redis | Processamento assíncrono sem timeout |
+| **API** | FastAPI + Uvicorn | Webhook WhatsApp |
+| **WhatsApp** | Evolution API | Gateway de mensagens |
+| **Parser PDF** | LlamaParse (cloud) / PyMuPDF (local) | Extracção de texto dos editais |
+| **Debug** | Chainlit | Interface de teste visual |
+| **Infra** | Docker + Docker Compose | Orquestração de containers |
 
-**Contas necessárias:**
+### Recursos de hardware necessários
 
-| Serviço | Link | Plano |
+| Recurso | Mínimo | Recomendado |
 |---|---|---|
-| Groq (LLM) | [console.groq.com](https://console.groq.com) | Free |
-| LlamaCloud (parse PDFs) | [cloud.llamaindex.ai](https://cloud.llamaindex.ai) | Free |
-| HuggingFace (embedding) | [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) | Free |
-| LangSmith (observabilidade) | [smith.langchain.com](https://smith.langchain.com) | Free até 5k traces/mês |
+| RAM | 8 GB | 16 GB |
+| CPU | 4 cores | 6+ cores |
+| GPU | Não necessária (CPU-only) | Qualquer (sem CUDA obrigatório) |
+| Disco | 5 GB | 10 GB |
+
+> ✅ Testado e desenvolvido num PC com **AMD RX 580** e **16 GB RAM** — sem CUDA, sem GPU dedicada para IA.
 
 ---
 
-## 2. O `.env` — entendendo de uma vez por todas
-
-O `.env` é um arquivo de texto simples com uma variável por linha:
-
-```
-GROQ_API_KEY=gsk_...
-DB_USER=postgres
-REDIS_URL=redis://localhost:6379/0
-```
-
-Ele guarda suas chaves de API **fora do código** — o git ignora este arquivo via `.gitignore`. Você versiona o `.env.example` (com valores fictícios) e cria o `.env` real só na sua máquina.
-
-### Como o `.env` chega a cada componente
-
-```
-.env  (arquivo no seu computador)
-  │
-  ├─── Docker Compose lê automaticamente ──────────────────────────────────┐
-  │                                                                         │
-  │  Uso 1: Interpolação no docker-compose.yml                              │
-  │  Antes de subir, o Compose substitui ${DB_USER} pelo valor do .env     │
-  │  Ex: DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/  │
-  │       ↓ vira ↓                                                          │
-  │      DATABASE_URL=postgresql+psycopg://postgres:senha@db:5432/          │
-  │                                                                         │
-  │  Uso 2: env_file: .env no serviço bot                                   │
-  │  Injeta o .env completo DENTRO do container em runtime                  │
-  └─────────────────────────────────────────────────────────────────────────┘
-                                    │
-                          dentro do container
-                                    │
-  ┌─────────────────────────────────▼──────────────────────────────────────┐
-  │  src/infrastructure/settings.py (pydantic-settings)                    │
-  │  Lê variáveis de ambiente → settings.GROQ_API_KEY, settings.REDIS_URL  │
-  └─────────────────────────────────────────────────────────────────────────┘
-```
-
-### Por que algumas variáveis aparecem tanto no `.env` quanto no `environment:` do docker-compose?
-
-Três variáveis usam **nomes de serviço Docker** como host (`db`, `redis`, `waha`) — não `localhost`. No seu `.env` você tem `localhost` para funcionar em dev local. O `docker-compose.yml` sobrescreve essas três especificamente:
-
-```yaml
-environment:
-  - DATABASE_URL=postgresql+psycopg://${DB_USER}:${DB_PASS}@db:5432/${DB_NAME}
-  - REDIS_URL=redis://redis:6379/0
-  - WAHA_BASE_URL=http://waha:3000
-```
-
-Tudo o mais (GROQ_API_KEY, HF_TOKEN, LLAMA_CLOUD_API_KEY etc.) vem direto do `env_file: .env`.
-
-### Criando o `.env`
-
-```bash
-cp .env.example .env
-nano .env   # preencha com seus valores reais
-```
-
----
-
-## 3. config.py vs settings.py — qual usar?
-
-**Use `settings.py`. Delete o `config.py`.**
-
-| Característica | `config.py` (antigo) | `settings.py` (novo) |
-|---|---|---|
-| Lê o `.env` | `os.getenv()` sem validação | Pydantic valida tipo automaticamente |
-| Valor inválido | Silencioso (bug tarde) | Falha no startup com mensagem clara |
-| `print()` de debug | Sim — vaza em produção | Não |
-| Testável | Difícil | `Settings(_env_file="tests/.env.test")` |
-| Singleton | Não | `@lru_cache` — instanciado uma vez |
-
-**Como migrar em 30 segundos:**
-
-```bash
-# Troque em todos os arquivos que ainda usam config.py:
-grep -r "from src.config import" src/
-```
-
-```python
-# Antes (apague o config.py depois da troca)
-from src.config import settings
-
-# Depois
-from src.infrastructure.settings import settings
-```
-
-Os nomes das variáveis são idênticos — `settings.GROQ_API_KEY`, `settings.REDIS_URL` etc.
-
----
-
-## 4. Quickstart — subindo em 5 passos
-
-```bash
-# 1. Clone e configure
-git clone <repo-url> meuBotRAG
-cd meuBotRAG
-cp .env.example .env
-nano .env          # preencha GROQ_API_KEY, DB_PASS, WAHA_API_KEY, LLAMA_CLOUD_API_KEY
-
-# 2. Coloque os PDFs na pasta dados/
-# Os nomes devem ser EXATAMENTE esses (case sensitive):
-ls dados/
-# calendario-academico-2026.pdf
-# edital_paes_2026.pdf
-# guia_contatos_2025.pdf
-
-# 3. Suba todos os serviços
-docker-compose up -d --build
-
-# 4. Acompanhe o startup (aguarde ~2 minutos — ingestão dos PDFs)
-docker-compose logs -f bot
-
-# 5. Verifique se está tudo ok
-curl http://localhost:8000/health
-# {"status":"ok","redis":true,"agente":true,"dev_mode":false}
-
-curl http://localhost:8000/banco/sources
-# Deve mostrar os 3 PDFs ingeridos
-```
-
-**Para expor ao WhatsApp via ngrok:**
-
-```bash
-ngrok http 8000
-# Copie a URL HTTPS gerada, ex: https://abc123.ngrok.io
-# No .env, atualize: WHATSAPP_HOOK_URL=https://abc123.ngrok.io/webhook
-# Reinicie o bot: docker-compose restart bot
-```
-
----
-
-## 5. Desenvolvimento local sem Docker
-
-```bash
-# 1. Python 3.11
-python3.11 -m venv .venv && source .venv/bin/activate
-
-# 2. Dependências
-pip install -r requirements.txt
-
-# 3. Sobe só a infra (banco + redis) via Docker
-docker-compose up -d db redis
-
-# 4. Ajusta o .env para localhost
-# DATABASE_URL=postgresql+psycopg://postgres:senha@localhost:5433/vectordb
-# REDIS_URL=redis://localhost:6379/0
-
-# 5. Roda o bot
-uvicorn src.main:app --reload --port 8000
-
-# 6. Painel de debug (outra janela de terminal)
-pip install chainlit tiktoken
-chainlit run debug/debug_chainlit.py --port 8001
-```
-
----
-
-## 6. Arquitetura — as 6 camadas
-
-O projeto segue **Clean Architecture**. A regra fundamental: **camadas internas nunca importam camadas externas**.
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  INTERFACE        src/api/                               │
-│  FastAPI routes, schemas Pydantic, endpoints HTTP        │
-├─────────────────────────────────────────────────────────┤
-│  APPLICATION      src/application/                       │
-│  Casos de uso: orquestra as camadas abaixo               │
-│  handle_webhook → handle_message                         │
-├─────────────────────────────────────────────────────────┤
-│  AGENT            src/agent/                             │
-│  AgentExecutor LangChain, state, prompts, validação      │
-├─────────────────────────────────────────────────────────┤
-│  DOMAIN           src/domain/           ← SEM I/O        │
-│  Entidades, menu stateless, router por regex             │
-│  Testável com assert puro, sem nenhum mock               │
-├─────────────────────────────────────────────────────────┤
-│  INFRASTRUCTURE   src/infrastructure/  src/memory/       │
-│                   src/rag/             src/providers/    │
-│  Redis, pgvector, LLM, settings, observabilidade         │
-├─────────────────────────────────────────────────────────┤
-│  EXTERNAL         WAHA · Groq · pgvector · Redis         │
-│  Serviços externos — nunca importados pela camada Domain │
-└─────────────────────────────────────────────────────────┘
-```
-
----
-
-## 7. Estrutura de pastas
+## 📁 Estrutura de Pastas
 
 ```
 meuBotRAG/
 │
-├── dados/                              # PDFs para ingestão (não vai ao git)
+├── src/
+│   ├── agent/
+│   │   ├── core.py               ← Orquestrador principal (9 passos)
+│   │   └── prompts.py            ← SYSTEM_UEMA, prompts, few-shot examples
+│   │
+│   ├── application/
+│   │   ├── handle_message.py     ← Ponte WhatsApp ↔ AgentCore
+│   │   └── tasks.py              ← Tasks Celery (processar_mensagem_task)
+│   │
+│   ├── domain/
+│   │   ├── entities.py           ← AgentResponse, Rota, Mensagem (dataclasses)
+│   │   ├── guardrails.py         ← Guardrails: greeter, block list, self-RAG signal
+│   │   ├── menu.py               ← Navegação de menu estático (regex, stateless)
+│   │   └── semantic_router.py    ← Roteamento por similaridade vetorial (Redis KNN)
+│   │
+│   ├── infrastructure/
+│   │   ├── celery_app.py         ← Configuração Celery
+│   │   ├── observability.py      ← Logs estruturados e métricas
+│   │   ├── redis_client.py       ← Cliente Redis singleton + índices BM25/HNSW
+│   │   └── settings.py           ← Variáveis de ambiente (Pydantic Settings)
+│   │
+│   ├── memory/
+│   │   ├── long_term_memory.py   ← Fatos do utilizador (Redis JSON + KNN)
+│   │   ├── memory_extractor.py   ← Extracção de fatos em background (Gemini)
+│   │   ├── redis_memory.py       ← Histórico legacy + estado do menu
+│   │   └── working_memory.py     ← Sessão activa (sinais, histórico compactado)
+│   │
+│   ├── middleware/
+│   │   └── dev_guard.py          ← Dedup, spam guard, whitelist de dev
+│   │
+│   ├── providers/
+│   │   └── gemini_provider.py    ← Cliente Gemini + retry + structured outputs
+│   │
+│   ├── rag/
+│   │   ├── embeddings.py         ← Modelo BAAI/bge-m3 singleton (CPU)
+│   │   ├── hybrid_retriever.py   ← BM25 + Vector → RRF → contexto hierárquico
+│   │   ├── ingestion.py          ← PDF → chunks → Redis (com manifesto de hash)
+│   │   └── query_transform.py    ← Step-back, rewrite, sub-queries (Gemini)
+│   │
+│   ├── services/
+│   │   └── evolution_service.py  ← Envio de mensagens via Evolution API
+│   │
+│   └── tools/
+│       ├── __init__.py           ← get_tools_ativas()
+│       ├── calendar_tool.py      ← Tool: calendário académico
+│       ├── tool_contatos.py      ← Tool: contactos UEMA
+│       └── tool_edital.py        ← Tool: edital PAES 2026
+│
+├── debug/
+│   └── debug_chainlit.py         ← Painel de debug visual (Chainlit)
+│
+├── dados/                        ← PDFs institucionais (não comitar)
 │   ├── calendario-academico-2026.pdf
 │   ├── edital_paes_2026.pdf
-│   └── guia_contatos_2025.pdf
+│   ├── guia_contatos_2025.pdf
+│   ├── contatos_saoluis.txt
+│   └── regras_ru.txt
 │
-├── debug/                              # Ferramentas de desenvolvimento
-│   ├── debug_chainlit.py               # Painel interativo (sem WhatsApp)
-│   └── chainlit.toml                   # Visual do painel (não vai ao Docker)
-│
-├── src/                                # Código-fonte da aplicação
-│   ├── main.py                         # Bootstrap FastAPI
-│   │
-│   ├── api/                            # Camada de interface
-│   │   └── schemas.py                  # Modelos Pydantic de request/response
-│   │
-│   ├── application/                    # Casos de uso
-│   │   ├── handle_webhook.py           # Recebe e valida payload WAHA
-│   │   └── handle_message.py           # Decide: menu direto ou agente
-│   │
-│   ├── agent/                          # Núcleo do agente LangChain
-│   │   ├── core.py                     # AgentExecutor + histórico Redis
-│   │   ├── state.py                    # AgentState: objeto de trabalho
-│   │   ├── prompts.py                  # Todos os prompts (fonte única)
-│   │   └── validator.py                # Valida output antes de enviar
-│   │
-│   ├── domain/                         # Regras de negócio puras — SEM I/O
-│   │   ├── entities.py                 # Mensagem, AgentResponse, Rota, EstadoMenu
-│   │   ├── menu.py                     # Lógica de menu (stateless, testável)
-│   │   └── router.py                   # Roteamento por intenção (regex puro)
-│   │
-│   ├── rag/                            # Retrieval-Augmented Generation
-│   │   ├── vector_store.py             # Singleton pgvector + embedding BAAI/bge-m3
-│   │   └── ingestor.py                 # LlamaParse + chunking + salva no banco
-│   │
-│   ├── tools/                          # Tools do agente LangChain
-│   │   ├── __init__.py                 # Lista de tools ativas
-│   │   ├── tool_calendario.py          # Busca datas no pgvector
-│   │   ├── tool_edital.py              # Busca regras do PAES no pgvector
-│   │   └── tool_contatos.py            # Busca contatos no pgvector
-│   │
-│   ├── services/                       # Integrações externas
-│   │   └── waha_service.py             # HTTP client do WAHA
-│   │
-│   ├── providers/                      # Provedores de LLM
-│   │   └── groq_provider.py            # ChatGroq com retry no 429
-│   │
-│   ├── infrastructure/                 # Configuração e clientes de infra
-│   │   ├── settings.py                 # Pydantic Settings — lê o .env
-│   │   ├── redis_client.py             # Singleton Redis compartilhado
-│   │   └── observability.py            # Logs estruturados + métricas
-│   │
-│   ├── memory/                         # Histórico de conversas
-│   │   └── redis_memory.py             # LangChain history + estado menu
-│   │
-│   └── middleware/                     # Filtros de segurança
-│       └── dev_guard.py                # Whitelist, dedup, validação WAHA
-│
-├── tests/
-│   ├── unit/                           # Sem Docker, sem mocks de infra
-│   │   ├── test_menu.py
-│   │   ├── test_router.py
-│   │   └── test_validator.py
-│   ├── integration/                    # Com Redis e pgvector reais
-│   └── e2e/                            # Fluxo completo com Groq mockado
-│
-├── docker-compose.yml                  # Orquestra: waha + db + redis + bot
-├── Dockerfile                          # Imagem do bot
-├── requirements.txt                    # Dependências Python
-├── pyproject.toml                      # Config de pytest e metadados
-├── .env.example                        # Template do .env (vai ao git)
-├── .env                                # Suas chaves reais (NÃO vai ao git)
-└── .gitignore
+├── .env.example                  ← Template de configuração
+├── docker-compose.yml            ← 4 serviços: redis, evolution-postgres, bot, celery-worker
+├── Dockerfile
+├── requirements.txt
+└── pyproject.toml
 ```
 
 ---
 
-## 8. Descrição de cada arquivo
+## 📦 Pré-requisitos
 
-### `src/main.py`
-
-Ponto de entrada da aplicação FastAPI. Configura logging, filtra ruído de logs do uvicorn e httpx, e no evento de startup executa em sequência: (1) ingestão dos PDFs se o banco estiver vazio, (2) diagnóstico dos sources se `DEV_MODE=true`, (3) inicialização do agente com as tools ativas, (4) inicialização do WAHA com configuração do webhook.
-
-Endpoints: `POST /webhook`, `GET /health`, `GET /logs`, `GET /metrics`, `GET /banco/sources`.
-
----
-
-### `src/infrastructure/settings.py`
-
-**Substitui completamente o `config.py`.** Usa `pydantic-settings` para ler o `.env` com validação automática de tipos. É um singleton via `@lru_cache` — instanciado uma única vez em todo o processo. Se uma variável obrigatória estiver ausente ou com tipo errado, o processo falha no startup com mensagem clara.
-
-Importe em qualquer módulo:
-```python
-from src.infrastructure.settings import settings
-print(settings.GROQ_API_KEY)
-```
-
-### `src/infrastructure/redis_client.py`
-
-Singleton do cliente Redis. Um único pool de conexões compartilhado por `memory/`, `middleware/` e `infrastructure/observability.py`. Sem instâncias espalhadas. `get_redis()` retorna sempre o mesmo objeto. `redis_ok()` retorna `bool` sem lançar exceção — usado no `/health`.
-
-### `src/infrastructure/observability.py`
-
-Substitui o `logger_service.py`. Singleton `obs` com métodos `obs.error()`, `obs.warn()`, `obs.info()` que logam no terminal **e** salvam no Redis com `ltrim` (mantém últimos 100 por nível). `obs.registrar_resposta()` salva métricas de tokens, latência e iterações para análise via `/metrics`.
+- **Docker** e **Docker Compose** v2+
+- **Python 3.11** ou 3.12 (para o painel de debug local)
+- Conta Google AI Studio com API Key do Gemini (gratuita)
+- Conta LlamaIndex Cloud (opcional, para melhor extracção de PDFs complexos)
+- **Evolution API** configurada e acessível
 
 ---
 
-### `src/domain/entities.py`
+## 🔧 Configuração
 
-Tipos puros de domínio — sem Redis, sem Groq, sem nenhum import externo. São os tipos que trafegam entre todas as camadas. Contém: `Rota` (enum: CALENDARIO, EDITAL, CONTATOS, GERAL), `EstadoMenu` (enum: MAIN, SUB_CALENDARIO, SUB_EDITAL, SUB_CONTATOS), `Mensagem` (dados brutos do WhatsApp), `RAGResult` (chunk retornado pelo pgvector), `AgentResponse` (resposta final do agente).
-
-### `src/domain/menu.py`
-
-Lógica de menu **100% stateless**. Recebe `(texto, estado_atual)` e retorna um `dict` indicando se a resposta é um menu direto ou deve ir para o LLM. Sem Redis, sem I/O. O estado vem injetado por `handle_message.py`. Testável com um simples `assert` sem nenhum mock. Contém os textos dos menus, opções numéricas expandidas em perguntas completas para o LLM, e regex de saudações/voltar.
-
-### `src/domain/router.py`
-
-Roteamento por intenção usando regex puro. Recebe `(texto, estado)` e retorna uma `Rota`. Sem I/O. O padrão EDITAL é avaliado **antes** do CALENDARIO para resolver a ambiguidade de "data de inscrição do PAES" (→ EDITAL, não CALENDARIO). Se o usuário está em um submenu ativo, a rota é forçada por esse submenu independente do texto.
-
----
-
-### `src/agent/core.py`
-
-Orquestra o agente LangChain. No método `inicializar(tools)`: monta `ChatGroq`, `ChatPromptTemplate` com o `SYSTEM_PROMPT`, `create_tool_calling_agent`, `AgentExecutor` (com `max_iterations` e `max_execution_time` do settings), e `RunnableWithMessageHistory` ligado ao `get_historico_limitado` do Redis. Ativa o LangSmith se `settings.langsmith_ativo`. No método `responder(state)`: invoca o agente, valida o output, registra métricas. Trata dois erros críticos: 429 (rate limit Groq) com mensagem amigável, e `tool_use_failed` (histórico corrompido) limpando o Redis e retentando sem histórico.
-
-### `src/agent/state.py`
-
-`AgentState` é o objeto de trabalho que carrega todo o contexto de uma execução: identificação do usuário, rota detectada, prompt enriquecido, contador de iterações, tokens de entrada/saída, resultados RAG acumulados e timestamp de início para calcular latência. Dataclass Python puro — sem I/O.
-
-### `src/agent/prompts.py`
-
-**Fonte única de todos os prompts.** Nenhum outro arquivo deve ter strings de system prompt. Contém: `SYSTEM_PROMPT` (prompt principal do agente com todas as regras e descrição das tools), `_CONTEXTOS` (dict de Rota → instrução específica para aquela área), `montar_prompt_enriquecido()` (combina rota + contexto do usuário + mensagem), mensagens de erro amigáveis (`MSG_RATE_LIMIT`, `MSG_ERRO_TECNICO`, `MSG_NAO_ENCONTRADO`), e `OUTPUTS_INVALIDOS` (frozenset de strings internas do LangChain que jamais devem ir ao usuário).
-
-### `src/agent/validator.py`
-
-Última barreira antes de enviar ao WhatsApp. Verifica: output não é uma string interna do LangChain ("Agent stopped due to max iterations." etc.), output tem mais de 10 caracteres, output não é vazio ou só espaço. Retorna `ValidationResult(valido, output, motivo)`. Puro, sem I/O, testável com `assert`.
-
----
-
-### `src/rag/vector_store.py`
-
-Singleton do modelo de embedding (BAAI/bge-m3, ~1.3GB) e da conexão com pgvector. O modelo é carregado **uma única vez** via `@lru_cache` — chamadas de múltiplas tools reutilizam a mesma instância sem custo. Configura `HF_TOKEN` no ambiente antes do download para evitar rate limit do HuggingFace Hub. O parâmetro `normalize_embeddings=True` melhora a similaridade coseno.
-
-### `src/rag/ingestor.py`
-
-Processa os arquivos da pasta `dados/`. O dict `PDF_CONFIG` é a fonte única de verdade: mapeia nome exato do arquivo para instrução de parsing e parâmetros de chunking. PDFs são parseados com LlamaParse usando instrução específica por arquivo (tabelas de calendário, vagas do edital, contatos). TXTs são lidos diretamente sem LlamaParse. O metadado `source` salvo no banco é o nome exato do arquivo — deve bater com `SOURCE_*` em cada tool.
-
----
-
-### `src/tools/__init__.py`
-
-Registra as tools ativas via `get_tools_ativas()`. Para adicionar uma nova tool: crie o arquivo em `src/tools/`, importe a fábrica aqui, adicione à lista.
-
-### `src/tools/tool_calendario.py`
-
-Busca eventos do Calendário Acadêmico 2026 no pgvector filtrado por `source = "calendario-academico-2026.pdf"`. Usa retriever MMR com `k=4`, `fetch_k=25`, `lambda_mult=0.75` (75% relevância, 25% diversidade). Normaliza a query removendo acentos antes da busca.
-
-### `src/tools/tool_edital.py`
-
-Busca regras e vagas do Edital PAES 2026 filtrado por `source = "edital_paes_2026.pdf"`. Usa retriever `similarity` (não MMR) porque as seções do edital são bem distintas — queremos os chunks mais similares à query, não diversidade.
-
-### `src/tools/tool_contatos.py`
-
-Busca contatos institucionais filtrado por `source = "guia_contatos_2025.pdf"`. Usa MMR com `lambda_mult=0.65` (mais diversidade que o calendário) para trazer contatos de **setores diferentes** quando a query é ampla ("contatos do CECEN" deve retornar vários coordenadores, não o mesmo repetido).
-
----
-
-### `src/application/handle_webhook.py`
-
-Ponto de entrada de toda mensagem recebida. Recebe o payload bruto do WAHA, chama `DevGuard.validar()`, converte o resultado para a entidade `Mensagem` e chama `handle_message()`. Retorna `{"status": "ok"}` sempre (WAHA não precisa de resposta específica).
-
-### `src/application/handle_message.py`
-
-Orquestrador principal. Fluxo: (1) carrega estado do menu do Redis, (2) chama `domain/menu.processar_mensagem()` (stateless), (3) se resposta de menu direto → envia sem LLM, (4) se ação → chama `domain/router.analisar()`, monta prompt enriquecido, cria `AgentState` e chama `agent_core.responder()`, (5) persiste contexto, (6) envia resposta via WAHA.
-
----
-
-### `src/memory/redis_memory.py`
-
-Gerencia três tipos de dados no Redis:
-
-**Histórico de conversa** (TTL 30min): usa `RedisChatMessageHistory` do LangChain com duas camadas de proteção — sanitização de `tool_calls` órfãos (quando o Groq retorna 400/`tool_use_failed`, a AIMessage com tool_calls fica no Redis sem o ToolMessage correspondente, corrompendo as próximas chamadas) e sliding window de 20 mensagens com corte sempre em `HumanMessage` (nunca no meio de um par tool).
-
-**Estado do menu** (TTL 30min): qual submenu o usuário está navegando. Persiste entre mensagens para que "1" no `SUB_EDITAL` signifique "vagas AC" e não a opção 1 do menu principal.
-
-**Contexto do usuário** (TTL 1h): última intenção, nome, curso — para enriquecer o prompt.
-
-### `src/services/waha_service.py`
-
-HTTP client async para o WAHA usando `httpx`. Métodos: `enviar_mensagem(chat_id, texto)`, `verificar_sessao()`, `configurar_webhook()`, `inicializar()` (chamado no startup). Todos com tratamento de `ConnectError` e `TimeoutException`.
-
-### `src/middleware/dev_guard.py`
-
-"Porteiro" de toda mensagem. Valida em ordem: evento é `"message"`, não é `fromMe`, `chat_id` existe e é válido, não é grupo (`@g.us`), não é status broadcast. Em `DEV_MODE=true`: sender_phone deve estar na `DEV_WHITELIST`. Deduplica via Redis (TTL 5min): mesmo `event_id` não é processado duas vezes.
-
-### `src/providers/groq_provider.py`
-
-Singleton do `ChatGroq` com retry automático em erro 429 (rate limit) usando backoff exponencial: espera 2s, depois 4s, depois 8s entre tentativas. Evita que uma rajada de mensagens simultâneas quebre o agente.
-
----
-
-### `debug/debug_chainlit.py`
-
-Painel interativo para testar o agente sem precisar do WhatsApp. Usa os mesmos módulos de produção (`agent_core`, `domain/menu`, `domain/router`, `redis_memory`). Exibe a rota detectada e o estado do menu como metadados. Comandos disponíveis no chat: `/ajuda`, `/status`, `/limpar`, `/diagnostico`, `/modo agente`, `/modo direto`, `/ingerir`, `/exportar`.
-
-### `debug/chainlit.toml`
-
-Configura o visual do painel Chainlit. A opção mais importante é `hide_cot = false` — faz aparecer os Steps internos ("🤖 Agent [CALENDARIO] · Latência: 1200ms") no painel. Em produção, não existe Chainlit. **Não vai ao Docker.**
-
----
-
-### Arquivos de configuração
-
-| Arquivo | Vai ao git? | Vai ao Docker? | Para que serve |
-|---|---|---|---|
-| `.env` | ❌ Não | Sim, via `env_file:` | Suas chaves reais |
-| `.env.example` | ✅ Sim | Não | Template para novos devs |
-| `docker-compose.yml` | ✅ Sim | É lido pelo Docker | Orquestra os containers |
-| `Dockerfile` | ✅ Sim | Define a imagem | Receita da imagem do bot |
-| `requirements.txt` | ✅ Sim | Sim, copiado e usado pelo pip | Dependências Python |
-| `pyproject.toml` | ✅ Sim | Não diretamente | pytest, metadados do projeto |
-| `debug/chainlit.toml` | ✅ Sim | ❌ Não | Visual do painel de debug |
-
----
-
-## 9. Como uma mensagem é processada — pipeline completo
-
-```
-Usuário digita no WhatsApp
-        │
-        ▼
-WAHA (container Docker) detecta a mensagem
-Faz POST para: http://bot-rag:8000/webhook
-        │
-        ▼
-src/main.py — FastAPI recebe o JSON bruto
-        │
-        ▼
-src/application/handle_webhook.py
-  │
-  ├─ middleware/dev_guard.py valida:
-  │    ✓ evento == "message"?
-  │    ✓ não é fromMe?
-  │    ✓ chat_id existe e não é grupo?
-  │    ✓ DEV_MODE: sender está na whitelist?
-  │    ✓ event_id não processado nos últimos 5min? (dedup Redis)
-  │
-  └─ Cria Mensagem(user_id, chat_id, body)
-        │
-        ▼
-src/application/handle_message.py
-  │
-  ├─ 1. memory/redis_memory.get_estado_menu(user_id)
-  │       → "MAIN" ou "SUB_CALENDARIO" etc.
-  │
-  ├─ 2. domain/menu.processar_mensagem(body, estado)
-  │       Stateless. Sem Redis. Só recebe texto + estado.
-  │       Decide: é menu principal? submenu? ou vai para o LLM?
-  │
-  ├─── SE tipo == "menu_principal" ou "submenu":
-  │       memory/redis_memory.set_estado_menu(user_id, novo_estado)
-  │       waha_service.enviar_mensagem(chat_id, texto_menu)
-  │       FIM — sem chamar o Groq
-  │
-  └─── SE tipo == "llm":
-         │
-         ├─ domain/router.analisar(prompt, estado)
-         │    Regex puro, sem I/O
-         │    → Rota: CALENDARIO | EDITAL | CONTATOS | GERAL
-         │
-         ├─ memory/redis_memory.get_contexto(user_id)
-         │    → {ultima_intencao: "EDITAL", nome: "João", ...}
-         │
-         ├─ agent/prompts.montar_prompt_enriquecido(prompt, rota, ctx)
-         │    → "[CONTEXTO]\nÁrea: CALENDARIO\n..."
-         │
-         ├─ AgentState(user_id, rota, prompt_enriquecido, ...)
-         │
-         └─ agent/core.responder(state)
-                │
-                ├─ RunnableWithMessageHistory
-                │    Carrega histórico Redis (sanitizado + sliding window)
-                │
-                ├─ Groq LLM recebe: system_prompt + histórico + mensagem
-                │    Decide qual tool chamar e com qual query
-                │
-                ├─ tools/tool_calendario.py  (se rota == CALENDARIO)
-                │    retriever.invoke(query normalizada)
-                │    pgvector → k=4 chunks filtrados por source
-                │    → "EVENTO: Matrícula | DATA: 03/02 | SEM: 2026.1"
-                │
-                ├─ tools/tool_edital.py  (se rota == EDITAL)
-                │    → vagas, cotas, cronograma
-                │
-                ├─ tools/tool_contatos.py  (se rota == CONTATOS)
-                │    → emails, telefones, responsáveis
-                │
-                ├─ Groq LLM sintetiza resposta final
-                │    (máximo 3 parágrafos ou 6 itens)
-                │
-                └─ agent/validator.validar(state, output)
-                       ✓ não é string interna do LangChain?
-                       ✓ tem mais de 10 chars?
-                       ✓ não está vazio?
-                       → ValidationResult(valido, output_sanitizado)
-                              │
-         ┌─────────────────────┘
-         │
-         ├─ memory/redis_memory.set_contexto(user_id, {ultima_intencao: rota})
-         ├─ infrastructure/observability.registrar_resposta(tokens, latência)
-         └─ waha_service.enviar_mensagem(chat_id, resposta)
-                │
-                ▼
-        WAHA envia ao WhatsApp do usuário
-```
-
----
-
-## 10. Pipeline de testes
-
-### Três níveis de teste
-
-```
-tests/
-├── unit/         → sem Docker, sem mocks, sem Redis — só Python puro
-├── integration/  → com Redis e pgvector reais (docker-compose up db redis)
-└── e2e/          → fluxo completo (Groq mockado)
-```
-
-### Testes unitários — rodam agora, sem nada instalado além do Python
+### 1. Clonar e preparar o projecto
 
 ```bash
-pip install pytest pytest-asyncio pytest-cov
-pytest tests/unit/ -v
-
-# Com cobertura
-pytest tests/unit/ --cov=src/domain --cov-report=term-missing
+git clone https://github.com/seu-usuario/meuBotRAG.git
+cd meuBotRAG
+cp .env.example .env
 ```
 
-Os testes unitários testam **só a camada de domínio** — a única que não tem I/O. Não precisam de Docker, Redis, pgvector ou Groq.
+### 2. Configurar o `.env`
 
-**`tests/unit/test_menu.py`** — 9 testes de `domain/menu.py`:
+```env
+# ── LLM (obrigatório) ────────────────────────────────────────────────────────
+GEMINI_API_KEY=sua_chave_aqui          # https://aistudio.google.com
+GEMINI_MODEL=gemini-2.0-flash
+GEMINI_TEMP=0.3
+GEMINI_MAX_TOKENS=1024
 
-```python
-# Exemplos do que é testado:
-resultado = processar_mensagem("oi", EstadoMenu.MAIN)
-assert resultado["type"] == "menu_principal"           # saudação → menu
+# ── HuggingFace (opcional, evita rate limit no download do modelo) ───────────
+HF_TOKEN=hf_xxxxxxxxxxxx              # https://huggingface.co/settings/tokens
 
-resultado = processar_mensagem("1", EstadoMenu.MAIN)
-assert resultado["type"] == "submenu"                  # opção numérica
-assert resultado["novo_estado"] == EstadoMenu.SUB_CALENDARIO
+# ── Parser de PDF ────────────────────────────────────────────────────────────
+# "pymupdf"    → gratuito, local, rápido (recomendado para começar)
+# "llamaparse" → pago ($0.003/pág), melhor para tabelas complexas
+PDF_PARSER=pymupdf
+LLAMA_CLOUD_API_KEY=                   # só necessário se PDF_PARSER=llamaparse
 
-resultado = processar_mensagem("voltar", EstadoMenu.SUB_EDITAL)
-assert resultado["novo_estado"] == EstadoMenu.MAIN     # volta do submenu
+# ── Redis Stack ──────────────────────────────────────────────────────────────
+REDIS_URL=redis://redis:6379/0         # dentro do Docker
+# REDIS_URL=redis://localhost:6379/0   # para debug local
 
-resultado = processar_mensagem("quando é a matrícula?", EstadoMenu.MAIN)
-assert resultado["type"] == "llm"                      # texto livre → LLM
+# ── Evolution API (WhatsApp) ─────────────────────────────────────────────────
+EVOLUTION_BASE_URL=http://evolution-api:8080
+EVOLUTION_API_KEY=sua_chave_evolution
+EVOLUTION_INSTANCE_NAME=meubot
+WHATSAPP_HOOK_URL=http://bot:9000/webhook
+
+# ── Dev / Debug ──────────────────────────────────────────────────────────────
+DEV_MODE=false
+DEV_WHITELIST=5598999999999            # números permitidos em modo dev (separados por vírgula)
+LOG_LEVEL=INFO
 ```
 
-**`tests/unit/test_router.py`** — 12 testes de `domain/router.py`:
+### 3. Adicionar os PDFs
 
-```python
-assert analisar("data de matrícula", EstadoMenu.MAIN) == Rota.CALENDARIO
-assert analisar("data de inscrição do PAES", EstadoMenu.MAIN) == Rota.EDITAL  # ambiguidade
-assert analisar("email da PROG", EstadoMenu.MAIN) == Rota.CONTATOS
-assert analisar("oi tudo bem", EstadoMenu.MAIN) == Rota.GERAL
-assert analisar("qualquer coisa", EstadoMenu.SUB_EDITAL) == Rota.EDITAL  # forçado pelo submenu
-```
-
-**`tests/unit/test_validator.py`** — 8 testes de `agent/validator.py`:
-
-```python
-# Output vazio → inválido
-r = validar(state, "")
-assert r.valido == False
-
-# String interna do LangChain → inválido, output substituído por mensagem amigável
-r = validar(state, "Agent stopped due to max iterations.")
-assert r.valido == False
-assert "não encontrei" in r.output.lower()
-
-# Output real → válido
-r = validar(state, "A matrícula de veteranos ocorre de 03/02 a 07/02/2026.")
-assert r.valido == True
-```
-
-### Adicionando novos testes
-
-```python
-# tests/unit/test_novo.py
-from src.domain.menu import processar_mensagem
-from src.domain.entities import EstadoMenu
-
-def test_alias_edital_abre_submenu():
-    r = processar_mensagem("vestibular", EstadoMenu.MAIN)
-    assert r["type"] == "submenu"
-    assert r["novo_estado"] == EstadoMenu.SUB_EDITAL
-
-def test_opcao_no_submenu_vira_prompt_expandido():
-    r = processar_mensagem("2", EstadoMenu.SUB_EDITAL)
-    assert r["type"] == "llm"
-    assert "documentos" in r["prompt"].lower()
-```
-
-### Testes de integração (estrutura preparada)
-
-```bash
-# Sobe só a infra
-docker-compose up -d db redis
-
-# Roda integration tests
-pytest tests/integration/ -v
-```
-
-### Ciclo de desenvolvimento recomendado
+Coloca os documentos institucionais na pasta `dados/`:
 
 ```
-1. Escreva o teste unitário primeiro (domínio puro)
-2. Implemente a funcionalidade
-3. pytest tests/unit/ -v  → deve passar
-4. Suba a infra: docker-compose up -d db redis
-5. pytest tests/integration/ -v  → com banco real
-6. docker-compose up --build  → teste completo
-7. curl /health + curl /banco/sources  → verifica PDFs
+dados/
+├── calendario-academico-2026.pdf   ← obrigatório
+├── edital_paes_2026.pdf            ← obrigatório
+├── guia_contatos_2025.pdf          ← obrigatório
+├── contatos_saoluis.txt            ← opcional
+└── regras_ru.txt                   ← opcional
 ```
+
+> ⚠️ Os PDFs são ingeridos automaticamente no primeiro arranque. O processo demora 2–10 minutos dependendo do tamanho e do parser escolhido.
 
 ---
 
-## 11. Painel de debug — Chainlit
+## 🚀 Como Correr
+
+### Produção (Docker Compose)
 
 ```bash
-# Instale (uma vez)
-pip install chainlit tiktoken
+# Iniciar todos os serviços
+docker compose up -d
 
-# Rode da RAIZ do projeto
+# Ver logs em tempo real
+docker compose logs -f bot celery-worker
+
+# Verificar saúde
+curl http://localhost:9000/health
+```
+
+### Verificar se a ingestão correu bem
+
+```bash
+curl http://localhost:9000/banco/sources
+# Deve retornar a lista de PDFs ingeridos com número de chunks
+```
+
+### Parar os serviços
+
+```bash
+docker compose down
+# Para apagar também os dados do Redis:
+docker compose down -v
+```
+
+### Desenvolvimento com hot-reload
+
+O `docker-compose.yml` já inclui volumes `./src:/app/src` e `./dados:/app/dados` — qualquer mudança no código reflecte imediatamente sem rebuild.
+
+---
+
+## 🌐 Endpoints da API
+
+| Método | Endpoint | Descrição |
+|---|---|---|
+| `POST` | `/webhook` | Recebe eventos da Evolution API |
+| `GET` | `/health` | Status do sistema (Redis, AgentCore, modelo) |
+| `GET` | `/logs?limit=20` | Últimos erros registados |
+| `GET` | `/metrics?limit=50` | Métricas de uso (tokens, latência, rotas) |
+| `GET` | `/banco/sources` | PDFs ingeridos no Redis |
+| `GET` | `/fatos/{user_id}` | Fatos long-term de um utilizador |
+| `GET` | `/memoria/{session_id}` | Working memory de uma sessão |
+| `DELETE` | `/memoria/{session_id}` | Limpa a sessão de um utilizador |
+
+---
+
+## 🧠 Sistema de Memória
+
+O bot implementa **3 camadas de memória**, inspiradas na arquitectura do [Agent Memory Server (Redis)](https://github.com/redis/agent-memory-server):
+
+### Camada 1 — Working Memory (sessão activa)
+
+```
+Redis Key: chat:{session_id}
+TTL: 30 minutos de inactividade
+```
+
+Guarda as últimas mensagens da conversa activa com **sliding window de 8 turns**. Garante que o Gemini recebe apenas o histórico relevante, sem estourar o context window.
+
+### Camada 2 — Sinais de Contexto
+
+```
+Redis Key: mem:work:{session_id}
+TTL: 30 minutos
+```
+
+Hash com metadados rápidos da sessão: `ultima_tool`, `rota`, `ultimo_topico`, `confianca_routing`. Usados para optimizar o roteamento nas mensagens seguintes.
+
+### Camada 3 — Long-Term Factual Memory
+
+```
+Redis Key (lista):  mem:facts:list:{user_id}
+Redis Key (vector): mem:facts:vec:{user_id}:{hash}
+TTL: 30 dias
+```
+
+Fatos extraídos de conversas passadas pelo `memory_extractor.py`. Exemplos reais:
+- `"Aluno do curso de Engenharia Civil, turno noturno"`
+- `"Inscrito no PAES 2026 na categoria BR-PPI"`
+- `"Dúvida recorrente sobre trancamento de matrícula"`
+
+Estes fatos são injectados no prompt de geração, permitindo respostas personalizadas sem o aluno ter de se repetir.
+
+**Extracção em background:** O `memory_extractor.py` corre após cada resposta sem bloquear o fluxo principal. Usa Gemini com Structured Output (`ExtracaoFatosSchema`) para garantir que apenas fatos verificáveis são guardados, com cooldown de 2 minutos entre extrações.
+
+---
+
+## 🔍 RAG Híbrido
+
+### Por que a busca simples por vector alucina datas e siglas
+
+Embeddings capturam **semântica** mas não **exactidão lexical**. A query `"matrícula veteranos"` pode recuperar um chunk de 2025 porque é semanticamente similar — o modelo não distingue anos.
+
+### Como a busca híbrida resolve isto
+
+```
+Query: "matrícula veteranos UEMA 2026.1 data período"
+         │                           │
+         ▼                           ▼
+    Embedding                    BM25 (keyword)
+    (semântica)                  (exactidão)
+         │                           │
+         └──────────── RRF ──────────┘
+                        │
+                        ▼
+          EVENTO: Matrícula de veteranos
+          DATA: 03/02/2026 a 07/02/2026
+          SEM: 2026.1
+          [FONTE: Calendário Académico UEMA 2026]
+```
+
+O **BM25** garante que `"2026.1"`, `"veteranos"`, `"BR-PPI"` e outras siglas são encontradas por match exacto, enquanto o **vetor** garante que a intenção semântica é compreendida. O **RRF (Reciprocal Rank Fusion)** funde os dois rankings para o melhor resultado.
+
+### Chunking hierárquico anti-alucinação
+
+Cada chunk é formatado com um cabeçalho que ancora o LLM:
+
+```
+[EDITAL PAES 2026 | edital]
+CURSO: Engenharia Civil | TURNO: Noturno | AC: 40 | PcD: 2 | TOTAL: 42
+```
+
+O Gemini vê explicitamente de onde veio a informação antes do conteúdo — estudos de RAG mostram que cabeçalhos de fonte reduzem alucinações em ~40%.
+
+---
+
+## 🗺 Roteamento Semântico
+
+O `semantic_router.py` decide qual documento consultar **sem chamar o LLM** — apenas por similaridade vectorial no Redis.
+
+```
+Mensagem: "quando começa a matrícula?"
+    │
+    ▼
+Embedding da mensagem (CPU, ~10ms)
+    │
+    ▼
+Redis KNN: encontra tool mais similar
+    │
+    ├── score > 0.80 → ALTA CONFIANÇA
+    │   → Rota.CALENDARIO + source_filter="calendario-academico-2026.pdf"
+    │   → Skip do Query Transform (economiza ~120 tokens)
+    │
+    ├── score 0.62–0.80 → MÉDIA CONFIANÇA
+    │   → Rota.CALENDARIO + doc_type="calendario"
+    │   → Executa Query Transform para enriquecer a query
+    │
+    └── score < 0.62 → BAIXA CONFIANÇA
+        → Rota.GERAL → Gemini decide livremente
+```
+
+**Tools registadas:**
+- `consultar_calendario_academico` → Rota.CALENDARIO
+- `consultar_edital_paes_2026` → Rota.EDITAL
+- `consultar_contatos_uema` → Rota.CONTATOS
+
+---
+
+## 🐛 Debug com Chainlit
+
+O painel de debug corre localmente e conecta ao mesmo Redis que o Docker.
+
+### Configuração
+
+```bash
+# 1. Instalar dependências de debug
+pip install chainlit tiktoken google-genai redis[hiredis]
+
+# 2. Criar .env.local para apontar ao Redis do Docker
+cat > .env.local << EOF
+REDIS_URL=redis://localhost:6379/0
+GEMINI_API_KEY=sua_chave_aqui
+EOF
+
+# 3. Correr o Chainlit (sempre da raiz do projecto)
 chainlit run debug/debug_chainlit.py --port 8001
-# Acesse: http://localhost:8001
 ```
 
-### O que o painel exibe
-
-Cada mensagem mostra:
-- A **rota detectada** pelo `domain/router.py` (ex: `CALENDARIO`)
-- O **estado do menu** no momento (ex: `MAIN`)
-- Um **Step interno** com latência e tokens estimados
-- A **resposta final** do agente
-
-### Comandos disponíveis no chat
+### Comandos disponíveis no painel
 
 | Comando | Descrição |
 |---|---|
-| `/ajuda` | Lista todos os comandos |
-| `/status` | Modelo, LangSmith, HF_TOKEN, métricas da sessão |
-| `/limpar` | Limpa histórico Redis + estado do menu do usuário de teste |
-| `/diagnostico` | Quais PDFs foram ingeridos (debug do "Não encontrei") |
-| `/modo agente` | Fluxo completo: menu → router → agente |
-| `/modo direto` | Só o agente, sem menu/router |
+| `/status` | Mostra estado do Redis, AgentCore e PDFs ingeridos |
+| `/fatos` | Lista todos os fatos long-term do utilizador de debug |
+| `/extracao` | Força extracção de fatos da conversa actual |
+| `/router <query>` | Testa o semantic router para uma query |
+| `/limpar` | Limpa sessão e histórico |
 | `/ingerir` | Força re-ingestão dos PDFs |
-| `/exportar` | Baixa log completo da sessão em .txt |
+| `/exportar` | Exporta log da sessão |
+| `/ajuda` | Lista todos os comandos |
 
-### Diferença entre `/modo agente` e `/modo direto`
-
-- **Modo agente**: passa pelo `domain/menu.py` e `domain/router.py` exatamente como em produção. Use para testar o comportamento real.
-- **Modo direto**: vai direto ao `agent_core`, sem menu nem router. Use para testar respostas específicas isolando o agente.
+> ⚠️ Requer Python 3.11 ou 3.12 — o Chainlit não suporta Python 3.13+.
 
 ---
 
-## 12. LangSmith — rastreamento do agente
+## 🗓 Roadmap
 
-Rastreia automaticamente cada chamada do agente sem nenhuma mudança no código de negócio.
+### Próximas melhorias planeadas
 
-### Como ativar
+- [ ] **Semantic Cache** — guardar respostas a perguntas frequentes no Redis (economia estimada: ~34% dos tokens)
+- [ ] **Guardrails activos** — activar `guardrails.py` no `handle_message.py` e remover `menu.py` / `router.py`
+- [ ] **Self-RAG** — skip do retriever para perguntas que não precisam de documentos
+- [ ] **Corrective RAG (CRAG)** — re-busca automática se o score RRF dos chunks for < 0.35
+- [ ] **Few-shot examples no system prompt** — 3–5 exemplos Q&A para reduzir alucinações de formato
+- [ ] **Modelo local** — Qwen2.5-7B-Instruct quantizado Q4_K_M (~4.5GB RAM) via llama.cpp para $0 absoluto
 
-```env
-LANGCHAIN_API_KEY=ls__...
-LANGCHAIN_PROJECT=uema-bot
-LANGCHAIN_TRACING_V2=true
-```
+### Melhorias de arquitectura futuras
 
-### O que você vê no dashboard
-
-- Qual tool foi chamada e com qual query exata
-- Tokens de entrada/saída por step (cada chamada ao Groq)
-- Latência total e por etapa
-- Histórico de runs para comparar comportamentos
-- Erros com stack trace completo e contexto
-
-Acesse: [smith.langchain.com](https://smith.langchain.com) → projeto `uema-bot`.
-
-O `agent/core.py` configura as variáveis de ambiente automaticamente no startup quando `settings.langsmith_ativo` for `True`.
+- [ ] **Gateway Go** — separar o webhook HTTP (Go, alta concorrência) do worker de IA (Python) para cenários multi-tenant ou alto volume
+- [ ] **Multi-tenant** — suporte a múltiplas instituições (UFMA, UFRJ, etc.) com o mesmo código
 
 ---
 
-## 13. Perguntas frequentes
+## 📄 Licença
 
-**O bot responde "Não encontrei" para tudo.**
-
-Os nomes dos PDFs não estão batendo com `SOURCE_*` nas tools. Confirme:
-
-```bash
-curl http://localhost:8000/banco/sources
-# ou no Chainlit: /diagnostico
-```
-
-Os valores retornados devem ser IDÊNTICOS (case sensitive) às chaves em `src/rag/ingestor.py:PDF_CONFIG` e às constantes `SOURCE_*` em cada tool.
+Este projecto é académico e de uso interno. Consulte o ficheiro `LICENSE` para os termos completos.
 
 ---
 
-**O Groq retorna erro 429 (rate limit).**
+<div align="center">
 
-O `providers/groq_provider.py` tem retry com backoff exponencial. Para reduzir chamadas: diminua `MAX_HISTORY_MESSAGES` (padrão: 6) e `AGENT_MAX_ITERATIONS` (padrão: 3) no `.env`.
+Construído com ❤️ para os alunos da UEMA
 
----
+`FastAPI` · `Gemini Flash` · `Redis Stack` · `BAAI/bge-m3` · `Celery` · `Evolution API` · `Docker`
 
-**Erro 400 com "tool_use_failed" no log.**
-
-O `memory/redis_memory.py` sanitiza automaticamente `tool_calls` órfãos no início de cada sessão. Se persistir, use `/limpar` no Chainlit ou adicione no `.env`:
-
-```env
-# Reinicia história de um usuário específico via endpoint ou código:
-# from src.memory.redis_memory import clear_tudo
-# clear_tudo("5598987654321")
-```
-
----
-
-**A ingestão está muito lenta.**
-
-O modelo BAAI/bge-m3 (~1.3GB) é baixado na primeira vez. Configure `HF_TOKEN` no `.env` para evitar rate limit do HuggingFace Hub. O download ocorre só uma vez — depois fica em cache no container.
-
----
-
-**Quero adicionar um novo PDF ao bot.**
-
-1. Coloque o arquivo em `dados/`
-2. Adicione a entrada em `src/rag/ingestor.py:PDF_CONFIG` com o nome exato
-3. Crie `src/tools/tool_novo.py` com `SOURCE_NOVO = "nome-exato.pdf"`
-4. Registre em `src/tools/__init__.py`
-5. Reinicie o bot (a ingestão roda no startup) ou use `/ingerir` no Chainlit
-
----
-
-**Quero adicionar uma nova área (ex: Suporte Técnico).**
-
-1. `src/domain/entities.py` → adicione `SUPORTE = "SUPORTE"` em `Rota` e `SUB_SUPORTE` em `EstadoMenu`
-2. `src/domain/router.py` → adicione o padrão regex em `_PADROES`
-3. `src/domain/menu.py` → adicione texto e opções em `TEXTO_SUBMENU` e `OPCOES_SUBMENU`
-4. `src/agent/prompts.py` → adicione contexto de rota em `_CONTEXTOS`
-5. Crie e registre a tool correspondente
-
----
-
-**Como trocar o modelo LLM?**
-
-```env
-# No .env
-GROQ_MODEL=llama-3.1-8b-instant   # mais rápido, menos preciso
-# ou
-GROQ_MODEL=llama-3.3-70b-versatile  # mais preciso (padrão)
-```
-
-Modelos disponíveis no Groq free: `llama-3.3-70b-versatile`, `llama-3.1-8b-instant`, `mixtral-8x7b-32768`, `gemma2-9b-it`.
-
----
-
-**Como ver os logs e métricas?**
-
-```bash
-# Últimos 20 erros
-curl http://localhost:8000/logs
-
-# Últimas 50 respostas com tokens e latência
-curl http://localhost:8000/metrics
-
-# Verificar se Redis e agente estão ok
-curl http://localhost:8000/health
-```
+</div>
