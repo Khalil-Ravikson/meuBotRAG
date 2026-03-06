@@ -250,7 +250,7 @@ def buscar_fatos_relevantes(
 
     # ── Computa embedding da pergunta ────────────────────────────────────────
     try:
-        from src.rag.vector_store import get_embeddings
+        from src.rag.embeddings import get_embeddings
         embeddings_model = get_embeddings()
         vetor_pergunta = embeddings_model.embed_query(pergunta)
     except Exception as e:
