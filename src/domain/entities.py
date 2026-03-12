@@ -1,8 +1,10 @@
 """
-domain/entities.py — Entidades de domínio puras
-================================================
-Sem Redis. Sem Groq. Sem I/O.
-Tipos que trafegam entre todas as camadas.
+domain/entities.py — Entidades de domínio puras (v4)
+======================================================
+Sem Redis. Sem I/O. Tipos que trafegam entre todas as camadas.
+
+MUDANÇAS v4:
+  Rota.WIKI adicionada → tool_wiki_ctic.py
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
@@ -14,6 +16,7 @@ class Rota(str, Enum):
     CALENDARIO = "CALENDARIO"
     EDITAL     = "EDITAL"
     CONTATOS   = "CONTATOS"
+    WIKI       = "WIKI"       # ← NOVO v4 — Wiki CTIC/UEMA
     GERAL      = "GERAL"
 
 
@@ -26,7 +29,6 @@ class EstadoMenu(str, Enum):
 
 @dataclass
 class Mensagem:
-    """Mensagem recebida do WhatsApp via WAHA."""
     user_id:   str
     chat_id:   str
     body:      str
@@ -37,7 +39,6 @@ class Mensagem:
 
 @dataclass
 class RAGResult:
-    """Resultado de uma busca no banco vetorial."""
     conteudo: str
     source:   str
     score:    float = 0.0
@@ -49,7 +50,6 @@ class RAGResult:
 
 @dataclass
 class AgentResponse:
-    """Resposta final do agente, pronta para enviar ao WhatsApp."""
     conteudo:       str
     rota:           Rota            = Rota.GERAL
     tokens_entrada: int             = 0

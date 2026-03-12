@@ -33,8 +33,8 @@ services:
       redis-stack-server
       --maxmemory 2gb
       --maxmemory-policy allkeys-lru
-      --save 60 1000
-      --appendonly no
+      --save 60 1
+      --appendonly yes
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s

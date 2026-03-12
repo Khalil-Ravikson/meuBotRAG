@@ -1,39 +1,55 @@
-# --- API & Core ---
+# =============================================================================
+# requirements.txt — Bot UEMA v4
+# =============================================================================
+# MUDANÇAS v4:
+#   REMOVIDO:  groq, langchain-groq, langchain-postgres, psycopg*, sqlalchemy, pgvector
+#              (Groq substituído por Gemini; pgvector substituído por Redis Stack)
+#   ADICIONADO: pandas, python-docx, openpyxl (multi-formato ingestion)
+#               beautifulsoup4, lxml, markdownify, httpx (wiki scraper)
+#               (httpx já existia, mantido com versão mínima)
+
+# ── API & Core ────────────────────────────────────────────────────────────────
 fastapi
-uvicorn
+uvicorn[standard]
 requests
 python-dotenv
 python-multipart
 nest_asyncio
-httpx>=0.24.0
-pydantic-settings
+httpx>=0.27.0
+pydantic-settings>=2.3
 
-# --- Stack LangChain (Estável 0.2.x) ---
+# ── LangChain (stack minimal — sem groq, sem postgres) ───────────────────────
 langchain==0.2.16
 langchain-community==0.2.16
 langchain-core==0.2.38
-langchain-groq==0.1.9
 langchain-text-splitters==0.2.4
-langchain-postgres==0.0.9
-# langchain-redis removido (causava conflito, usamos o 'redis' puro abaixo)
 langchain-huggingface==0.0.3
+# langchain-groq removido (migrado para Gemini)
+# langchain-postgres removido (migrado para Redis Stack)
 
-# --- Integrações & Drivers ---
-groq
-redis
+# ── Gemini ────────────────────────────────────────────────────────────────────
+google-genai==1.65.0
+
+# ── Redis Stack ───────────────────────────────────────────────────────────────
 redis[hiredis]>=5.0
-llama-parse
-pymupdf
+
+# ── Embedding (BAAI/bge-m3, CPU) ─────────────────────────────────────────────
 sentence-transformers
 tiktoken
-google-genai==1.65.0
+
+# ── Parsers de Documentos ─────────────────────────────────────────────────────
+pymupdf                  # .pdf — local, gratuito
+llama-parse              # .pdf — cloud (opcional, PDF_PARSER=llamaparse)
+pandas>=2.0              # .csv — NOVO v4
+python-docx>=1.1         # .docx — NOVO v4
+openpyxl>=3.1            # .xlsx — NOVO v4
+beautifulsoup4>=4.12     # .html + wiki scraper — NOVO v4
+lxml                     # parser HTML mais rápido para BeautifulSoup — NOVO v4
+markdownify>=0.12        # HTML → Markdown para wiki scraper — NOVO v4
+
+# ── Task Queue ────────────────────────────────────────────────────────────────
 celery[redis]>=5.3.6
 tenacity>=8.2.3
-# --- Banco de Dados ---
-psycopg[binary]
-sqlalchemy
-pgvector
-psycopg-pool
 
-# --- Interface & Debug ---
+# ── Debug & Interface ─────────────────────────────────────────────────────────
 chainlit

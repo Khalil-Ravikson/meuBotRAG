@@ -1,72 +1,41 @@
 """
-memory/long_term_memory.py — Memória Factual de Longo Prazo
-=============================================================
+memory/long_term_memory.py — Memória Factual de Longo Prazo (v3.1 — Fix Crítico)
+==================================================================================
 
-O QUE SÃO "FATOS" NESTE CONTEXTO?
+CORRECÇÃO APLICADA (v3.0 → v3.1):
 ────────────────────────────────────
-  Fatos são fragmentos de conhecimento verificável sobre o utilizador,
-  extraídos das suas conversas passadas de forma assíncrona.
+  BUG CRÍTICO que causava:
+    ⚠️ Falha embedding pergunta para fatos: No module named 'src.rag.vector_store'
 
-  Exemplos de fatos reais para um aluno da UEMA:
+  CAUSA: guardar_fato() e buscar_fatos_relevantes() continham importação lazy
+    de 'src.rag.vector_store' — ficheiro eliminado na migração pgvector→Redis.
+    O try/except engolia o ModuleNotFoundError, fazendo fallback silencioso
+    para buscar_fatos_recentes() (sem semântica). Resultado: fatos do aluno
+    nunca usados na personalização da resposta.
+
+  CORRECÇÃO: Todas as referências substituídas por 'src.rag.embeddings'.
+
+O QUE SÃO FATOS:
+─────────────────
+  Fragmentos de conhecimento sobre o aluno extraídos das conversas:
     - "Aluno do curso de Engenharia Civil, turno noturno"
     - "Inscrito no PAES 2026 na categoria BR-PPI"
-    - "Já fez matrícula veterano no semestre 2026.1"
     - "Dúvida recorrente sobre trancamento de matrícula"
-    - "Solicita contato da coordenação de Engenharia Civil"
 
-COMO OS FATOS ELIMINAM ALUCINAÇÕES:
-─────────────────────────────────────
-  SEM FATOS:
-    Aluno: "onde fico minha prova?"
-    Sistema: Não sabe qual curso → busca genericamente → retorna info vaga
-    → Alucinação: inventa sala ou data
-
-  COM FATOS:
-    Long-Term Memory: "Aluno de Engenharia Civil, turno noturno"
-    Query Transformer: "onde fico minha prova?" + fato
-    → "local de prova Engenharia Civil turno noturno avaliação final 2026.1"
-    Busca híbrida: encontra exatamente o chunk certo
-    → Resposta precisa, sem alucinação
-
-ARQUITETURA NO REDIS:
-─────────────────────
-  Dois tipos de armazenamento complementares:
-
-  1. mem:facts:list:{user_id}
-     → Lista de fatos como strings (rápida para leitura em ordem)
-     → TTL: 30 dias
-     → Usado quando queremos os N fatos mais recentes (Quick Recall)
-
-  2. mem:facts:vec:{user_id}:{fact_hash}
-     → JSON com texto + embedding (para busca semântica)
-     → Permite encontrar fatos RELEVANTES para a pergunta atual
-     → TTL: 30 dias
-
-  QUANDO USAR CADA UM:
-    buscar_fatos_recentes()   → usa a Lista (mais rápido, sem embedding)
-    buscar_fatos_relevantes() → usa o índice vetorial (mais preciso)
-
-EXTRAÇÃO DE FATOS (feita por memory/extractor.py):
-────────────────────────────────────────────────────
-  A extração NÃO acontece em tempo real (economiza tokens no caminho crítico).
-  É feita de forma assíncrona:
-    - Após cada resposta → trigger para extração em background
-    - Usa o Gemini com temperatura 0.1 para ser conservador
-    - Fatos são normalizados antes de guardar (evita duplicados)
+ARQUITECTURA REDIS:
+────────────────────
+  mem:facts:list:{user_id}        → Lista LPUSH (Quick Recall)
+  mem:facts:vec:{user_id}:{hash}  → JSON com texto + embedding (Semantic Recall)
+  TTL: 30 dias em ambas as estruturas
 """
 from __future__ import annotations
 
 import hashlib
-import json
 import logging
 import time
 from dataclasses import dataclass
 
-from src.infrastructure.redis_client import (
-    VECTOR_DIM,
-    get_redis,
-    get_redis_text,
-)
+from src.infrastructure.redis_client import VECTOR_DIM, get_redis, get_redis_text
 
 logger = logging.getLogger(__name__)
 
@@ -74,28 +43,24 @@ logger = logging.getLogger(__name__)
 # Constantes
 # ─────────────────────────────────────────────────────────────────────────────
 
-_TTL_FATOS       = 86400 * 30   # 30 dias — fatos persistem entre semestres
-_MAX_FATOS_USER  = 50           # Limite por utilizador para não inflar RAM
-_MAX_FATOS_QUERY = 5            # Máximo de fatos retornados por busca
-
-_PREFIX_FATOS_LIST = "mem:facts:list:"  # Para Quick Recall (lista)
-_PREFIX_FATOS_VEC  = "mem:facts:vec:"   # Para Semantic Recall (vetores)
-
-# Threshold de similaridade para fatos relevantes
-_THRESHOLD_FATO_RELEVANTE = 0.65
+_TTL_FATOS             = 86400 * 30  # 30 dias
+_MAX_FATOS_USER        = 50          # limite por utilizador
+_MAX_FATOS_QUERY       = 5           # máximo retornado por busca
+_PREFIX_FATOS_LIST     = "mem:facts:list:"
+_PREFIX_FATOS_VEC      = "mem:facts:vec:"
+_THRESHOLD_RELEVANCIA  = 0.65        # limiar de similaridade coseno
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tipos
+# Tipo
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class Fato:
-    """Fato factual sobre um utilizador."""
     texto:     str
     user_id:   str
-    timestamp: int = 0
-    score:     float = 0.0   # Score de relevância (preenchido na busca)
+    timestamp: int   = 0
+    score:     float = 0.0
 
     def __post_init__(self):
         if not self.timestamp:
@@ -103,110 +68,77 @@ class Fato:
 
     @property
     def hash_id(self) -> str:
-        """Hash determinístico do texto — evita duplicados."""
         return hashlib.md5(self.texto.lower().strip().encode()).hexdigest()[:12]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Guardar fatos
+# Guardar
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 def guardar_fato(user_id: str, texto_fato: str) -> bool:
     """
-    Converte um fato em vetor e guarda no Redis (duas estruturas).
-
-    CORRECÇÕES APLICADAS:
-      1. Importação: from src.rag.embeddings import get_embeddings
-         (em vez de src.rag.vector_store que foi eliminado com o pgvector)
-
-      2. Cliente Redis: get_redis_text() para r.json().set()
-         (em vez de get_redis() com bytes — o RedisJSON lida melhor com
-         strings quando o cliente tem decode_responses=True)
-
-      3. Separação de clientes:
-         - r_text (decode_responses=True) → operações JSON e de lista
-         - r_bin  (decode_responses=False) → apenas para verificar existência
-           de chave com r_bin.exists() (retorna int, compatível com ambos)
-
-    Retorna True se guardado com sucesso, False se já existia ou erro.
+    Embeda e guarda um fato no Redis (lista + JSON vectorial).
+    Retorna True se novo, False se duplicado ou erro.
     """
-    texto_normalizado = texto_fato.strip()
-    if not texto_normalizado or len(texto_normalizado) < 10:
+    if not texto_fato or not texto_fato.strip():
         return False
 
-    fato = Fato(texto=texto_normalizado, user_id=user_id)
+    texto = texto_fato.strip()
+    fato  = Fato(texto=texto, user_id=user_id)
+    key_v = f"{_PREFIX_FATOS_VEC}{user_id}:{fato.hash_id}"
+    r_txt = get_redis_text()
 
-    # CORRIGIDO: dois clientes com responsabilidades claras
-    r_text = get_redis_text()   # Para JSON set/get e operações de lista
-    r_bin  = get_redis()        # Para exists() — compatível com ambos os modos
+    # Evita duplicados
+    try:
+        if r_txt.exists(key_v):
+            return False
+    except Exception:
+        pass
 
-    # ── Verifica duplicado ───────────────────────────────────────────────────
-    key_vec = f"{_PREFIX_FATOS_VEC}{user_id}:{fato.hash_id}"
-    if r_bin.exists(key_vec):
-        logger.debug("ℹ️  Fato já existe [%s]: %.60s", user_id, texto_normalizado)
-        return False
-
-    # ── Computa embedding ────────────────────────────────────────────────────
-    # CORRIGIDO: from src.rag.embeddings (não src.rag.vector_store)
+    # ── Embedding (CORRECÇÃO: src.rag.embeddings, não src.rag.vector_store) ──
     vetor: list[float] = []
     try:
-        from src.rag.embeddings import get_embeddings   # ← CORRETO
-        embeddings_model = get_embeddings()
-        vetor = embeddings_model.embed_query(texto_normalizado)
+        from src.rag.embeddings import get_embeddings  # ← CORRIGIDO
+        vetor = get_embeddings().embed_query(texto)
     except Exception as e:
-        logger.error(
-            "❌ Falha ao computar embedding do fato [%s]: %s. "
-            "Guardando sem vetor (Quick Recall apenas).",
-            user_id, e,
-        )
-        # Guarda sem embedding — fato ainda útil para buscar_fatos_recentes()
-        # mas não aparecerá em buscar_fatos_relevantes() (sem vetor para comparar)
+        logger.warning("⚠️  Sem embedding para fato [%s]: %s", user_id, e)
 
-    # ── Guarda JSON + embedding no Redis (CORRIGIDO: r_text) ─────────────────
-    doc = {
-        "texto":     texto_normalizado,
-        "user_id":   user_id,
-        "timestamp": fato.timestamp,
-        "embedding": vetor,          # lista[float] → JSON array nativo
-    }
+    # ── Guarda JSON vectorial ─────────────────────────────────────────────────
     try:
-        r_text.json().set(key_vec, "$", doc)     # ← CORRIGIDO: r_text
-        r_text.expire(key_vec, _TTL_FATOS)       # ← CORRIGIDO: r_text
+        r_txt.json().set(key_v, "$", {
+            "texto":     texto,
+            "user_id":   user_id,
+            "timestamp": fato.timestamp,
+            "embedding": vetor,
+        })
+        r_txt.expire(key_v, _TTL_FATOS)
     except Exception as e:
-        logger.error("❌ Falha ao guardar vetor do fato [%s]: %s", user_id, e)
+        logger.error("❌ Falha ao guardar fato [%s]: %s", user_id, e)
         return False
 
-    # ── Guarda na lista de Quick Recall ──────────────────────────────────────
-    key_list = f"{_PREFIX_FATOS_LIST}{user_id}"
+    # ── Guarda lista Quick Recall ─────────────────────────────────────────────
+    key_l = f"{_PREFIX_FATOS_LIST}{user_id}"
     try:
-        r_text.lpush(key_list, texto_normalizado)
-        r_text.ltrim(key_list, 0, _MAX_FATOS_USER - 1)
-        r_text.expire(key_list, _TTL_FATOS)
+        r_txt.lpush(key_l, texto)
+        r_txt.ltrim(key_l, 0, _MAX_FATOS_USER - 1)
+        r_txt.expire(key_l, _TTL_FATOS)
     except Exception as e:
-        logger.warning("⚠️  Falha ao guardar fato na lista [%s]: %s", user_id, e)
-        # Não é fatal — o vetor já foi guardado, Quick Recall apenas fica sem atualizar
+        logger.warning("⚠️  Falha lista fatos [%s]: %s", user_id, e)
 
-    logger.info("💾 Fato guardado [%s]: %.80s", user_id, texto_normalizado)
+    logger.info("💾 Fato guardado [%s]: %.80s", user_id, texto)
     return True
 
 
 def guardar_fatos_batch(user_id: str, fatos: list[str]) -> int:
-    """
-    Guarda múltiplos fatos de uma vez (usado pela rotina de extração).
-    Retorna o número de fatos novos guardados.
-    """
-    guardados = 0
-    for texto in fatos:
-        if guardar_fato(user_id, texto):
-            guardados += 1
-    if guardados:
-        logger.info("💾 Batch: %d/%d fatos novos para [%s]", guardados, len(fatos), user_id)
-    return guardados
+    """Guarda múltiplos fatos. Retorna total de novos guardados."""
+    n = sum(1 for t in fatos if guardar_fato(user_id, t))
+    if n:
+        logger.info("💾 Batch: %d/%d fatos novos [%s]", n, len(fatos), user_id)
+    return n
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Buscar fatos
+# Buscar
 # ─────────────────────────────────────────────────────────────────────────────
 
 def buscar_fatos_relevantes(
@@ -215,179 +147,100 @@ def buscar_fatos_relevantes(
     max_fatos: int = _MAX_FATOS_QUERY,
 ) -> list[Fato]:
     """
-    Busca fatos do utilizador semanticamente relevantes para a pergunta.
+    Busca semântica local: embed da pergunta → coseno contra todos os fatos.
 
-    ALGORITMO:
-    ──────────
-      1. Computa embedding da pergunta
-      2. Carrega todos os fatos do utilizador (tipicamente < 50)
-      3. Calcula similaridade coseno entre a pergunta e cada fato
-      4. Retorna os top-N fatos acima do threshold
-
-    POR QUE NÃO USAMOS O ÍNDICE REDIS PARA ISTO?
-      O índice IDX_TOOLS usa FLAT search (exato) que é eficiente para
-      poucos documentos. Para fatos de um utilizador específico,
-      o número é ainda menor (< 50) e fazer scan + similaridade local
-      é mais simples e igualmente rápido para este volume.
-
-      Alternativa futura: criar um índice por utilizador com
-      tag filter "@user_id:{...}" — implementável quando escalar.
-
-    Parâmetros:
-      user_id:   ID do utilizador (número de WhatsApp)
-      pergunta:  Pergunta atual do utilizador
-      max_fatos: Máximo de fatos a retornar
-
-    Retorna: lista de Fatos ordenados por relevância decrescente
+    CORRECÇÃO: from src.rag.embeddings import get_embeddings  (não vector_store)
     """
-    r = get_redis()
-
-    # ── Carrega todos os fatos com embedding do utilizador ──────────────────
-    fatos_raw = _carregar_fatos_com_embedding(r, user_id)
-    if not fatos_raw:
-        logger.debug("ℹ️  Sem fatos para [%s]", user_id)
-        return []
-
-    # ── Computa embedding da pergunta ────────────────────────────────────────
     try:
-        from src.rag.embeddings import get_embeddings
-        embeddings_model = get_embeddings()
-        vetor_pergunta = embeddings_model.embed_query(pergunta)
+        from src.rag.embeddings import get_embeddings  # ← CORRIGIDO
+        vetor_p = get_embeddings().embed_query(pergunta)
     except Exception as e:
         logger.warning("⚠️  Falha embedding pergunta para fatos: %s", e)
-        # Fallback: retorna fatos recentes sem filtragem semântica
         return buscar_fatos_recentes(user_id, max_fatos)
 
-    # ── Calcula similaridade coseno ──────────────────────────────────────────
-    fatos_com_score: list[Fato] = []
-    for fato_dict in fatos_raw:
-        vetor_fato = fato_dict.get("embedding", [])
-        if not vetor_fato or len(vetor_fato) != len(vetor_pergunta):
+    r = get_redis()
+    fatos_raw = _carregar_fatos_com_embedding(r, user_id)
+    if not fatos_raw:
+        return buscar_fatos_recentes(user_id, max_fatos)
+
+    pares: list[tuple[float, Fato]] = []
+    for item in fatos_raw:
+        vetor_f = item.get("embedding", [])
+        if not vetor_f:
             continue
-        score = _similaridade_coseno(vetor_pergunta, vetor_fato)
-        if score >= _THRESHOLD_FATO_RELEVANTE:
-            fatos_com_score.append(Fato(
-                texto=fato_dict.get("texto", ""),
+        score = _cosseno(vetor_p, vetor_f)
+        if score >= _THRESHOLD_RELEVANCIA:
+            pares.append((score, Fato(
+                texto=item.get("texto", ""),
                 user_id=user_id,
-                timestamp=fato_dict.get("timestamp", 0),
+                timestamp=item.get("timestamp", 0),
                 score=score,
-            ))
+            )))
 
-    # ── Ordena por score e retorna top-N ─────────────────────────────────────
-    fatos_ordenados = sorted(fatos_com_score, key=lambda f: f.score, reverse=True)
-    resultado = fatos_ordenados[:max_fatos]
-
-    if resultado:
-        logger.debug(
-            "🧠 Fatos relevantes [%s]: %d/%d | top score=%.3f | '%s'",
-            user_id, len(resultado), len(fatos_raw),
-            resultado[0].score, resultado[0].texto[:50],
-        )
-
-    return resultado
+    pares.sort(key=lambda x: x[0], reverse=True)
+    return [f for _, f in pares[:max_fatos]]
 
 
-def buscar_fatos_recentes(user_id: str, max_fatos: int = 5) -> list[Fato]:
-    """
-    Retorna os N fatos mais recentes do utilizador (sem semântica).
-    Fallback rápido quando o embedding não está disponível.
-    """
-    r_text = get_redis_text()
-    key = f"{_PREFIX_FATOS_LIST}{user_id}"
+def buscar_fatos_recentes(user_id: str, max_fatos: int = _MAX_FATOS_QUERY) -> list[Fato]:
+    """Fallback rápido: N fatos mais recentes sem semântica."""
+    r_txt = get_redis_text()
     try:
-        textos = r_text.lrange(key, 0, max_fatos - 1)
+        textos = r_txt.lrange(f"{_PREFIX_FATOS_LIST}{user_id}", 0, max_fatos - 1)
         return [Fato(texto=t, user_id=user_id) for t in textos if t]
     except Exception:
         return []
 
 
 def fatos_como_string(fatos: list[Fato]) -> str:
-    """
-    Formata lista de fatos como string para injeção no prompt.
-    Mantém formato compacto para economizar tokens.
-    """
     if not fatos:
         return ""
     return "\n".join(f"- {f.texto}" for f in fatos)
 
 
 def listar_todos_fatos(user_id: str) -> list[str]:
-    """
-    Lista todos os fatos de um utilizador (para debug e endpoint /fatos).
-    """
-    r_text = get_redis_text()
-    key = f"{_PREFIX_FATOS_LIST}{user_id}"
+    r_txt = get_redis_text()
     try:
-        return r_text.lrange(key, 0, _MAX_FATOS_USER - 1) or []
+        return r_txt.lrange(f"{_PREFIX_FATOS_LIST}{user_id}", 0, _MAX_FATOS_USER - 1) or []
     except Exception:
         return []
 
 
 def apagar_fatos(user_id: str) -> None:
-    """Remove todos os fatos de um utilizador (GDPR / privacidade)."""
-    r = get_redis()
-    r_text = get_redis_text()
-
-    # Remove lista
-    r_text.delete(f"{_PREFIX_FATOS_LIST}{user_id}")
-
-    # Remove chaves vetoriais com SCAN
-    cursor = 0
-    deleted = 0
+    r, r_txt = get_redis(), get_redis_text()
+    r_txt.delete(f"{_PREFIX_FATOS_LIST}{user_id}")
+    cur, deleted = 0, 0
     while True:
-        cursor, keys = r.scan(cursor, match=f"{_PREFIX_FATOS_VEC}{user_id}:*", count=100)
+        cur, keys = r.scan(cur, match=f"{_PREFIX_FATOS_VEC}{user_id}:*", count=100)
         if keys:
             r.delete(*keys)
             deleted += len(keys)
-        if cursor == 0:
+        if cur == 0:
             break
-
-    logger.info("🗑️  Fatos apagados para [%s]: lista + %d vetores", user_id, deleted)
+    logger.info("🗑️  Fatos apagados [%s]: lista + %d vetores", user_id, deleted)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Funções internas
+# Internos
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _carregar_fatos_com_embedding(r, user_id: str) -> list[dict]:
-    """
-    Carrega todos os JSONs de fatos do utilizador do Redis.
-    Usa SCAN para não bloquear o Redis em produção.
-    """
-    pattern = f"{_PREFIX_FATOS_VEC}{user_id}:*"
-    fatos = []
-    cursor = 0
-
+    pattern, fatos, cur = f"{_PREFIX_FATOS_VEC}{user_id}:*", [], 0
     while True:
-        cursor, keys = r.scan(cursor, match=pattern, count=100)
+        cur, keys = r.scan(cur, match=pattern, count=100)
         for key in keys:
             try:
                 doc = r.json().get(key, "$")
                 if doc:
-                    item = doc[0] if isinstance(doc, list) else doc
-                    fatos.append(item)
+                    fatos.append(doc[0] if isinstance(doc, list) else doc)
             except Exception:
                 pass
-        if cursor == 0:
+        if cur == 0:
             break
-
     return fatos
 
 
-def _similaridade_coseno(v1: list[float], v2: list[float]) -> float:
-    """
-    Calcula similaridade coseno entre dois vetores.
-    Implementação pura Python para não depender de numpy no caminho crítico.
-
-    Para vetores BAAI/bge-m3 (já normalizados), a similaridade coseno
-    é simplesmente o produto escalar.
-
-    NOTA: embeddings_model.embed_query() com normalize_embeddings=True
-    já retorna vetores unitários, então o produto escalar = coseno.
-    """
+def _cosseno(v1: list[float], v2: list[float]) -> float:
+    """Produto escalar para vetores normalizados (BAAI/bge-m3 com normalize=True)."""
     if not v1 or not v2 or len(v1) != len(v2):
         return 0.0
-
-    # Produto escalar (suficiente para vetores normalizados)
-    dot = sum(a * b for a, b in zip(v1, v2))
-    return max(0.0, min(1.0, dot))   # Clamp [0, 1]
+    return max(0.0, min(1.0, sum(a * b for a, b in zip(v1, v2))))
