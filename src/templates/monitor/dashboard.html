@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monitor — Bot UEMA v5</title>
+  <link rel="stylesheet" href="/static/css/monitor.css">
+</head>
+<body>
+
+<!-- ── Header ─────────────────────────────────────────────────── -->
+<header class="header">
+  <div>
+    <h1>🎓 Bot UEMA — Monitor v5</h1>
+    <p class="meta">
+      Modelo: <strong>{{ modelo }}</strong> &nbsp;|&nbsp;
+      Redis: <strong>{{ redis_url.split("@")[-1] }}</strong> &nbsp;|&nbsp;
+      DEV: <strong>{{ dev_mode }}</strong>
+    </p>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <span class="meta">Última sync: <span id="updated-at">{{ updated_at }}</span></span>
+    <span class="badge-live">AO VIVO</span>
+    <button id="btn-refresh" class="btn btn-primary">↻ Actualizar</button>
+  </div>
+</header>
+
+<div class="container">
+
+  <!-- ── Cards de métricas ───────────────────────────────────── -->
+  <div class="cards">
+    <div class="card accent-primary" id="card-msgs">
+      <div class="value">—</div>
+      <div class="label">Mensagens</div>
+    </div>
+    <div class="card accent-yellow" id="card-tokens">
+      <div class="value">—</div>
+      <div class="label">Tokens consumidos</div>
+    </div>
+    <div class="card" id="card-lat">
+      <div class="value">—</div>
+      <div class="label">Latência média</div>
+    </div>
+    <div class="card accent-red" id="card-admin">
+      <div class="value">—</div>
+      <div class="label">Msgs ADMIN</div>
+    </div>
+    <div class="card" id="card-student">
+      <div class="value">—</div>
+      <div class="label">Msgs STUDENT</div>
+    </div>
+    <div class="card" id="card-guest">
+      <div class="value">—</div>
+      <div class="label">Msgs GUEST</div>
+    </div>
+  </div>
+
+  <!-- ── Gráficos ──────────────────────────────────────────────── -->
+  <div class="grid-2">
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Distribuição por Nível</span>
+      </div>
+      <div class="table-wrap" style="padding:20px">
+        <div id="chart-niveis">
+          <p class="empty">A carregar…</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Distribuição por Rota RAG</span>
+      </div>
+      <div class="table-wrap" style="padding:20px">
+        <div id="chart-rotas">
+          <p class="empty">A carregar…</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Tabela de logs ─────────────────────────────────────────── -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Log de Interações (últimas 50)</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>User ID</th>
+            <th>Nível</th>
+            <th style="text-align:right">Tokens</th>
+            <th style="text-align:right">Latência</th>
+            <th>Rota</th>
+            <th>Pergunta</th>
+          </tr>
+        </thead>
+        <tbody id="log-tbody">
+          <tr><td colspan="7" class="empty">A carregar…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- ── Erros recentes ─────────────────────────────────────────── -->
+  <div class="section">
+    <div class="section-header">
+      <span class="section-title">Erros Recentes (últimos 10)</span>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Timestamp</th>
+            <th>Contexto</th>
+            <th>Mensagem</th>
+          </tr>
+        </thead>
+        <tbody id="erros-tbody">
+          <tr><td colspan="3" class="empty">A carregar…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- /container -->
+
+<!-- Toast de actualização -->
+<div id="toast"></div>
+
+<script src="/static/js/monitor.js"></script>
+</body>
+</html>
