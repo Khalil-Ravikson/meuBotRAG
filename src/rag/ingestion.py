@@ -126,6 +126,50 @@ PDF_CONFIG: dict[str, dict] = {
     },
 }
 
+DOCUMENT_CONFIG = {
+
+    # ── Markdown de teste (este projecto) ────────────────────────────────────
+    "agente_rag_uema_spec.md": {
+        "doc_type":   "geral",
+        "titulo":     "Especificação Técnica Bot UEMA v5",
+        "chunk_size": 400,
+        "overlap":    60,
+        "label":      "ESPECIFICAÇÃO BOT UEMA v5",
+        # Perguntas de teste: thresholds CRAG, métricas de performance,
+        # tabela de formatos, perguntas T01-T08
+    },
+    "instrucoes_uso_agente.md": {
+        "doc_type":   "geral",
+        "titulo":     "Manual de Uso e Comandos — Bot UEMA",
+        "chunk_size": 350,
+        "overlap":    50,
+        "label":      "MANUAL USO BOT UEMA",
+        # Perguntas de teste: rate limits, comandos admin, ingestão, Linux
+        # O LLM deve distinguir contextos (bot vs Linux) dentro do doc
+    },
+
+    # ── CSV de teste (mock gerado) ────────────────────────────────────────────
+    # Coloca em dados/CSV/testes/
+    "vagas_mock_2026.csv": {
+        "doc_type":   "edital",
+        "titulo":     "Vagas Mock PAES 2026 (Teste)",
+        "chunk_size": 300,
+        "overlap":    40,
+        "label":      "VAGAS MOCK PAES 2026",
+        # Para testar: busca exacta de números "AC: 40", "BR-PPI: 8"
+    },
+    "contatos_mock.csv": {
+        "doc_type":   "contatos",
+        "titulo":     "Contatos Mock UEMA (Teste)",
+        "chunk_size": 250,
+        "overlap":    30,
+        "label":      "CONTATOS MOCK UEMA",
+        # Para testar: busca de email@uema.br, telefones (99) 9999-9999
+    },
+}
+
+
+
 _PARSERS_VALIDOS = {"pymupdf", "llamaparse"}
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,9 +388,13 @@ class Ingestor:
             return 0
 
     def _listar_ficheiros(self, data_dir: str) -> list[str]:
-        pdfs = glob.glob(os.path.join(data_dir, "*.[pP][dD][fF]"))
-        txts = glob.glob(os.path.join(data_dir, "*.[tT][xX][tT]"))
-        return sorted(pdfs + txts)
+        encontrados: set[str] = set()
+        for raiz, _, ficheiros in os.walk(data_dir):
+            for nome in ficheiros:
+                ext = os.path.splitext(nome)[1].lower()
+                if ext in _EXTENSOES_SUPORTADAS:
+                    encontrados.add(os.path.join(raiz, nome))
+        return sorted(encontrados)
 
     # ── CORREÇÃO BUG 1: _verificar_redis_vs_manifesto com lock por ficheiro ───
 

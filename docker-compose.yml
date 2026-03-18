@@ -145,6 +145,9 @@ services:
     volumes:
       - ./dados:/app/dados
       - ./src:/app/src
+      - ./tests:/app/tests
+      - ./static:/app/static        # adicione
+      - ./templates:/app/templates
       - /etc/localtime:/etc/localtime:ro
       - /etc/timezone:/etc/timezone:ro
     env_file:
