@@ -28,8 +28,14 @@ __pycache__/
 .vscode/
 
 
-#arquivos de modo Dev
-src/gradio.py
 
 #dados
 dados/*.pdf
+# Adicionado 
+.env.test
+.pytest_cache/
+dados/uploads/
+dados/PDF/testes/
+dados/CSV/testes/
+*.pdf
+*.csv
