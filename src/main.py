@@ -47,7 +47,7 @@ from src.application.tasks import processar_mensagem_task
 
 # ── Router do Monitor ─────────────────────────────────────────────────────────
 from src.api.monitor import router as monitor_router
-
+from src.api.router_pessoa import router as pessoa_router
 # =============================================================================
 # Logging
 # =============================================================================
@@ -79,9 +79,14 @@ app = FastAPI(
     description = "Assistente Académico UEMA — WhatsApp + RAG + Redis Stack",
 )
 
+from pathlib import Path
+
+# Calcula dinamicamente a raiz do projeto baseada em onde o main.py está
+BASE_DIR = Path(__file__).resolve().parent.parent
+
 # Static files e templates (para o monitor)
-app.mount("/static", StaticFiles(directory="/app/static"), name="static")
-templates = Jinja2Templates(directory="/app/templates")
+app.mount("/static", StaticFiles(directory=str(BASE_DIR/"static")), name="static")
+templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
 
 # CORS — só permite localhost em dev
 app.add_middleware(
@@ -94,6 +99,8 @@ app.add_middleware(
 
 # Inclui o router do monitor com prefix /monitor
 app.include_router(monitor_router, prefix="/monitor", tags=["Monitor"])
+app.include_router(pessoa_router)
+
 
 # Singletons
 api_service = EvolutionService()

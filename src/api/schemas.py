@@ -2,7 +2,8 @@
 api/schemas.py — Pydantic models de request/response
 """
 from __future__ import annotations
-from pydantic import BaseModel
+from pydantic import BaseModel, EmailStr, ConfigDict
+from src.domain.models import RoleEnum
 from typing import Any
 
 
@@ -21,3 +22,16 @@ class HealthResponse(BaseModel):
     agente:    bool
     dev_mode:  bool
     version:   str = "2.0"
+
+
+class PessoaBase(BaseModel):
+    nome : str
+    email: EmailStr
+    role : RoleEnum = RoleEnum.estudante
+class PessoaCreate(PessoaBase):
+    pass
+
+class PessoaResponse(PessoaBase):
+    id: int
+    
+    model_config = ConfigDict(from_attributes=True)
