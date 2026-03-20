@@ -28,13 +28,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-
+from src.application.crud_pessoa import buscar_pessoa_por_telefone
 from src.infrastructure.settings import settings
 from src.infrastructure.redis_client import (
     get_redis_text,
     inicializar_indices,
     redis_ok,
 )
+
 from src.infrastructure.observability import obs
 from src.infrastructure.semantic_cache import init_cache_index
 from src.agent.core import agent_core
@@ -44,7 +45,7 @@ from src.services.evolution_service import EvolutionService
 from src.rag.ingestion import Ingestor
 from src.tools import get_tools_ativas
 from src.application.tasks import processar_mensagem_task
-
+from src.infrastructure.database import AsyncSessionLocal
 # ── Router do Monitor ─────────────────────────────────────────────────────────
 from src.api.monitor import router as monitor_router
 from src.api.router_pessoa import router as pessoa_router
@@ -149,20 +150,48 @@ async def startup():
 @app.post("/webhook")
 async def webhook(request: Request):
     """Valida payload Evolution API e despacha para Celery."""
-    x_api_key = request.headers.get("apikey", "")
-    if settings.WEBHOOK_SECRET and x_api_key != settings.WEBHOOK_SECRET:
-        return JSONResponse({"status": "unauthorized"}, status_code=401)
+    #x_api_key = request.headers.get("apikey", "")
+    #if settings.WEBHOOK_SECRET and x_api_key != settings.WEBHOOK_SECRET:
+        #return JSONResponse({"status": "unauthorized"}, status_code=401)
 
     payload = await request.json()
     is_valid, identity_or_reason = await guard.validar(payload)
 
     if is_valid:
-        processar_mensagem_task.delay(identity_or_reason)
-        logger.debug("📥 Tarefa enfileirada: %s", identity_or_reason.get("chat_id"))
+            chat_id = identity_or_reason.get("chat_id", "")
+            telefone_limpo = chat_id.split("@")[0] if "@" in chat_id else chat_id
+
+            # 1. O PORTEIRO DO CTIC: Verifica o banco ANTES de mandar pra fila Celery
+            async with AsyncSessionLocal() as session:
+                pessoa = await buscar_pessoa_por_telefone(session, telefone=telefone_limpo)
+
+                if not pessoa:
+                    # 🚫 Se não tem cadastro, avisamos e matamos o processo com um 'return' precoce
+                    logger.info(f"🚫 Não cadastrado: {telefone_limpo}. Interceptando mensagem.")
+                    
+                    msg_falha = (
+                        "👋 *Olá! Sou o assistente virtual do CTIC/UEMA.*\n\n"
+                        "Verifiquei aqui e seu número não possui cadastro em nosso sistema de Helpdesk.\n"
+                        "Por favor, informe seu *e-mail institucional* para procedermos com o cadastro."
+                    )
+                    
+                    await api_service.send_text(chat_id, msg_falha)
+                    return JSONResponse({"status": "ok"}, status_code=200)
+
+                # ✅ Se tem cadastro, injetamos os dados para a IA usar depois
+                identity_or_reason["nome_usuario"] = pessoa.nome
+                identity_or_reason["role_usuario"] = pessoa.role.value
+                identity_or_reason["email_usuario"] = pessoa.email
+
+            # 2. O DESPACHO: Só envia para o Celery se passou pelo porteiro e existe no banco!
+            processar_mensagem_task.delay(identity_or_reason)
+            logger.debug("📥 Tarefa enfileirada para %s: %s", pessoa.nome, chat_id)
+            
     else:
+                    # 3. SE O DEVGUARD BLOQUEOU (ex: número não está na whitelist em modo DEV)
         logger.debug("🛑 DevGuard bloqueou: %s", identity_or_reason)
 
-    return JSONResponse({"status": "ok"}, status_code=200)
+        return JSONResponse({"status": "ok"}, status_code=200)
 
 # =============================================================================
 # Health & Observabilidade (mantidos em main.py — simples e críticos)
