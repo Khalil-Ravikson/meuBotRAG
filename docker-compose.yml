@@ -188,7 +188,72 @@ services:
       - EVOLUTION_BASE_URL=http://evolution-api:8080
       - TZ=America/Sao_Paulo
     command: celery -A src.infrastructure.celery_app.celery_app worker --loglevel=info --concurrency=2
-
+  # ---------------------------------------------------------------------------
+  # 6. NOVO — Celery Beat — agendador de tarefas periódicas
+  # ---------------------------------------------------------------------------
+  # IMPORTANTE: Deve existir APENAS UMA instância do Beat em produção.
+  # Múltiplos Beats causariam disparo duplicado de notificações.
+  # Por isso não usamos restart=unless-stopped em produção de alta escala,
+  # mas para o nosso caso (1 servidor) está correto.
+  celery-beat:
+    build: .
+    container_name: celery-beat
+    restart: unless-stopped
+    networks: [uema]
+    depends_on:
+      redis:
+        condition: service_healthy
+      bot:
+        condition: service_healthy   # aguarda o bot estar pronto (ingestão concluída)
+    volumes:
+      - ./dados:/app/dados
+      - ./src:/app/src
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - EVOLUTION_BASE_URL=http://evolution-api:8080
+      - TZ=America/Sao_Paulo
+    command: >
+      celery -A src.infrastructure.celery_app.celery_app beat
+      --loglevel=info
+      --scheduler celery.beat:PersistentScheduler
+      --schedule /tmp/celery_beat_schedule
+ 
+  # ---------------------------------------------------------------------------
+  # 7. NOVO — Celery Notif Worker — processa fila de notificações em lote
+  # ---------------------------------------------------------------------------
+  # Worker separado para não bloquear o processamento de mensagens WhatsApp.
+  # Concurrency=1: notificações são enviadas sequencialmente com delay de 1.2s
+  # entre mensagens (respeita limites da Evolution API e evita ban do WhatsApp).
+  celery-notif:
+    build: .
+    container_name: celery-notif
+    restart: unless-stopped
+    networks: [uema]
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./dados:/app/dados
+      - ./src:/app/src
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    env_file:
+      - .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - EVOLUTION_BASE_URL=http://evolution-api:8080
+      - TZ=America/Sao_Paulo
+    command: >
+      celery -A src.infrastructure.celery_app.celery_app worker
+      --loglevel=info
+      --concurrency=1
+      --queues=notificacoes
+      --hostname=notif@%h
+ 
 volumes:
   redis-data:
     driver: local

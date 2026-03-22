@@ -1,0 +1,310 @@
+"""
+tests/unit/test_registration_service.py — Testes da Máquina de Estados de Registo
+===================================================================================
+Sem Redis. Sem DB. Puro Python.
+Execute: pytest tests/unit/test_registration_service.py -v
+"""
+import json
+import pytest
+from unittest.mock import MagicMock, patch
+
+# Imports dos helpers puros (sem Redis)
+import sys, os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from src.services.registration_service import (
+    _validar_email,
+    _validar_nome,
+    _e_cancelamento,
+    DadosRegisto,
+    EstadoRegisto,
+    RegistrationService,
+)
+
+
+# =============================================================================
+# Testes das funções de validação (puras — sem estado)
+# =============================================================================
+
+class TestValidarEmail:
+    def test_email_aluno_valido(self):
+        assert _validar_email("joao@aluno.uema.br") is True
+
+    def test_email_uema_generico_valido(self):
+        assert _validar_email("maria.silva@uema.br") is True
+
+    def test_email_professor_valido(self):
+        assert _validar_email("prof.costa@professor.uema.br") is True
+
+    def test_email_gmail_invalido(self):
+        assert _validar_email("joao@gmail.com") is False
+
+    def test_email_sem_usuario_invalido(self):
+        assert _validar_email("@aluno.uema.br") is False
+
+    def test_email_vazio_invalido(self):
+        assert _validar_email("") is False
+
+    def test_email_sem_arroba_invalido(self):
+        assert _validar_email("joaoalumo.uema.br") is False
+
+    def test_email_case_insensitive(self):
+        # Deve aceitar maiúsculas
+        assert _validar_email("JOAO@ALUNO.UEMA.BR") is True
+
+    def test_email_com_ponto_no_usuario(self):
+        assert _validar_email("joao.pedro.silva@aluno.uema.br") is True
+
+
+class TestValidarNome:
+    def test_nome_completo_valido(self):
+        assert _validar_nome("João Silva") is True
+
+    def test_nome_com_tres_palavras(self):
+        assert _validar_nome("Maria da Silva") is True
+
+    def test_nome_com_hifen(self):
+        assert _validar_nome("Maria-João Silva") is True
+
+    def test_nome_so_uma_palavra(self):
+        assert _validar_nome("João") is False
+
+    def test_nome_vazio(self):
+        assert _validar_nome("") is False
+
+    def test_nome_com_numero_puro(self):
+        assert _validar_nome("João 123") is False
+
+    def test_nome_palavra_muito_curta(self):
+        assert _validar_nome("A B") is False  # palavras < 2 chars
+
+    def test_nome_normaliza_espacos(self):
+        # Múltiplos espaços devem funcionar após split/join
+        assert _validar_nome("João   Silva") is True
+
+    def test_nome_muito_longo(self):
+        nome_longo = "João " + "Silva " * 50  # > 200 chars
+        assert _validar_nome(nome_longo) is False
+
+
+class TestCancelamento:
+    def test_cancelar_directo(self):
+        assert _e_cancelamento("cancelar") is True
+
+    def test_sair(self):
+        assert _e_cancelamento("sair") is True
+
+    def test_com_slash(self):
+        assert _e_cancelamento("/cancelar") is True
+
+    def test_nao_e_cancelamento(self):
+        assert _e_cancelamento("João Silva") is False
+        assert _e_cancelamento("sim") is False
+        assert _e_cancelamento("1") is False
+
+
+# =============================================================================
+# Testes da máquina de estados (com Redis mockado)
+# =============================================================================
+
+def _make_redis_mock():
+    """Cria um mock de Redis que simula setex/get/delete em memória."""
+    store = {}
+
+    redis = MagicMock()
+
+    def setex(key, ttl, val):
+        store[key] = val
+
+    def get(key):
+        return store.get(key)
+
+    def delete(*keys):
+        for k in keys:
+            store.pop(k, None)
+
+    def incr(key):
+        val = int(store.get(key, 0)) + 1
+        store[key] = str(val)
+        return val
+
+    def expire(key, ttl):
+        pass  # ignorado no mock
+
+    redis.setex.side_effect = setex
+    redis.get.side_effect   = get
+    redis.delete.side_effect= delete
+    redis.incr.side_effect  = incr
+    redis.expire.side_effect= expire
+
+    return redis, store
+
+
+class TestRegistrationServiceFluxoCompleto:
+    """Testa o fluxo completo de registo."""
+
+    def setup_method(self):
+        self.redis, self.store = _make_redis_mock()
+        self.service = RegistrationService(self.redis)
+        self.phone   = "5598999990001"
+
+    # ── Início do fluxo ───────────────────────────────────────────────────────
+
+    def test_iniciar_retorna_mensagem_de_boas_vindas(self):
+        msg = self.service.iniciar(self.phone)
+        assert "Bem-vindo" in msg
+        assert "e-mail" in msg.lower()
+
+    def test_iniciar_cria_estado_no_redis(self):
+        self.service.iniciar(self.phone)
+        assert f"reg:{self.phone}" in self.store
+
+    def test_esta_em_registo_apos_iniciar(self):
+        self.service.iniciar(self.phone)
+        assert self.service.esta_em_registo(self.phone) is True
+
+    def test_nao_esta_em_registo_antes_de_iniciar(self):
+        assert self.service.esta_em_registo("9999999999") is False
+
+    # ── Email ─────────────────────────────────────────────────────────────────
+
+    def test_email_valido_avanca_para_nome(self):
+        self.service.iniciar(self.phone)
+        resultado = self.service.processar(self.phone, "joao@aluno.uema.br")
+        assert resultado.continua is True
+        assert "nome" in resultado.resposta.lower()
+        dados = self.service.get_dados(self.phone)
+        assert dados.estado == EstadoRegisto.WAITING_NAME.value
+        assert dados.email == "joao@aluno.uema.br"
+
+    def test_email_invalido_pede_nova_tentativa(self):
+        self.service.iniciar(self.phone)
+        resultado = self.service.processar(self.phone, "joao@gmail.com")
+        assert resultado.continua is True
+        assert resultado.concluido is False
+        assert "inválido" in resultado.resposta.lower()
+
+    def test_terceira_tentativa_invalida_abandona(self):
+        self.service.iniciar(self.phone)
+        for _ in range(_MAX_ATTEMPTS_MOCK := 3):
+            self.service.processar(self.phone, "email_invalido@gmail.com")
+        # Na terceira tentativa, deve abandonar
+        assert self.service.esta_em_registo(self.phone) is False
+
+    # ── Nome ──────────────────────────────────────────────────────────────────
+
+    def test_nome_valido_avanca_para_role(self):
+        self.service.iniciar(self.phone)
+        self.service.processar(self.phone, "joao@aluno.uema.br")  # email
+        resultado = self.service.processar(self.phone, "João Pedro Silva")
+        assert resultado.continua is True
+        assert "1️⃣" in resultado.resposta or "Estudante" in resultado.resposta
+        dados = self.service.get_dados(self.phone)
+        assert dados.estado == EstadoRegisto.WAITING_ROLE.value
+        assert dados.nome == "João Pedro Silva"
+
+    def test_nome_invalido_pede_nova_tentativa(self):
+        self.service.iniciar(self.phone)
+        self.service.processar(self.phone, "joao@aluno.uema.br")
+        resultado = self.service.processar(self.phone, "João")  # só 1 palavra
+        assert resultado.continua is True
+        assert "inválido" in resultado.resposta.lower()
+
+    # ── Papel/Role ────────────────────────────────────────────────────────────
+
+    def test_role_1_aceite(self):
+        self._avancar_ate_role()
+        resultado = self.service.processar(self.phone, "1")
+        assert resultado.continua is True
+        assert "Confirmar" in resultado.resposta or "confirmar" in resultado.resposta
+        dados = self.service.get_dados(self.phone)
+        assert dados.role == "estudante"
+
+    def test_role_palavra_aceite(self):
+        self._avancar_ate_role()
+        resultado = self.service.processar(self.phone, "estudante")
+        dados = self.service.get_dados(self.phone)
+        assert dados.role == "estudante"
+
+    def test_role_invalido_pede_nova_tentativa(self):
+        self._avancar_ate_role()
+        resultado = self.service.processar(self.phone, "99")
+        assert resultado.continua is True
+        assert "inválida" in resultado.resposta.lower() or "Opção" in resultado.resposta
+
+    # ── Confirmação ───────────────────────────────────────────────────────────
+
+    def test_sim_conclui_registo(self):
+        self._avancar_ate_confirmacao()
+        resultado = self.service.processar(self.phone, "sim")
+        assert resultado.concluido is True
+        assert resultado.continua is False
+
+    def test_s_maiusculo_conclui_registo(self):
+        self._avancar_ate_confirmacao()
+        resultado = self.service.processar(self.phone, "SIM")
+        assert resultado.concluido is True
+
+    def test_nao_abandona_registo(self):
+        self._avancar_ate_confirmacao()
+        resultado = self.service.processar(self.phone, "não")
+        assert resultado.abandonado is True
+        assert resultado.continua is False
+
+    # ── Cancelamento universal ────────────────────────────────────────────────
+
+    def test_cancelar_em_qualquer_estado_abandona(self):
+        for email_enviado in [False, True]:
+            phone = f"559899999{99 if not email_enviado else 98}"
+            self.service.iniciar(phone)
+            if email_enviado:
+                self.service.processar(phone, "joao@aluno.uema.br")
+            resultado = self.service.processar(phone, "cancelar")
+            assert resultado.abandonado is True
+
+    # ── Dados finais ──────────────────────────────────────────────────────────
+
+    def test_dados_completos_apos_confirmacao(self):
+        self._avancar_ate_confirmacao()
+        resultado = self.service.processar(self.phone, "sim")
+        assert resultado.dados is not None
+        assert resultado.dados.email == "joao@aluno.uema.br"
+        assert resultado.dados.nome  == "João Pedro Silva"
+        assert resultado.dados.role  == "estudante"
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+
+    def _avancar_ate_role(self):
+        self.service.iniciar(self.phone)
+        self.service.processar(self.phone, "joao@aluno.uema.br")
+        self.service.processar(self.phone, "João Pedro Silva")
+
+    def _avancar_ate_confirmacao(self):
+        self._avancar_ate_role()
+        self.service.processar(self.phone, "1")
+
+
+# =============================================================================
+# Testes de DadosRegisto (serialização/deserialização)
+# =============================================================================
+
+class TestDadosRegisto:
+    def test_serializa_e_deserializa(self):
+        dados = DadosRegisto(
+            estado="WAITING_NAME",
+            email="joao@aluno.uema.br",
+            nome="",
+            role="",
+            phone="5598999990001",
+        )
+        json_str = dados.to_json()
+        dados2   = DadosRegisto.from_json(json_str)
+        assert dados2.email == "joao@aluno.uema.br"
+        assert dados2.estado == "WAITING_NAME"
+
+    def test_json_valido(self):
+        dados = DadosRegisto(phone="123")
+        parsed = json.loads(dados.to_json())
+        assert "estado" in parsed
+        assert "email" in parsed
+        assert "phone" in parsed

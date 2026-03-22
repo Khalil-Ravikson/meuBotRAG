@@ -167,7 +167,7 @@ DOCUMENT_CONFIG = {
         # Para testar: busca de email@uema.br, telefones (99) 9999-9999
     },
 }
-
+_EXTENSOES_SUPORTADAS = {".pdf", ".txt", ".csv", ".md"}
 
 
 _PARSERS_VALIDOS = {"pymupdf", "llamaparse"}

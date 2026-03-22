@@ -49,7 +49,11 @@ async def dashboard(request: Request, limit: int = 100):
         "version":    "5.0",
         "updated_at": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
     }
-    return templates.TemplateResponse("monitor/dashboard.html", contexto)
+    return templates.TemplateResponse(
+    request=request,
+    name="monitor/dashboard.html",
+    context=contexto
+    )
 
 
 # =============================================================================
